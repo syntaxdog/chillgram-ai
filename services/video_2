@@ -1,0 +1,493 @@
+# services/video_generate.py
+from __future__ import annotations
+
+import os
+import io
+import json
+import time
+import asyncio
+import base64
+import shutil
+import mimetypes
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List
+
+import requests
+from PIL import Image
+from fastapi import UploadFile, HTTPException
+
+from google import genai
+from google.genai import types
+
+# =========================================================
+# Path / Storage
+# =========================================================
+BASE_DIR = Path(__file__).resolve().parent.parent  # services/ 기준이면 상위로
+AI_DIR = BASE_DIR / "ai"
+
+
+def _ensure_product_dir(product_id: int) -> Path:
+    """
+    main.py에서 ensure를 갖고 있지만,
+    service에서 import하면 순환참조 위험이 있어서 여기서 독립적으로 처리.
+    """
+    d = BASE_DIR / str(product_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# =========================================================
+# Helpers
+# =========================================================
+def _download(url: str, out_path: Path) -> Path:
+    r = requests.get(url, stream=True, timeout=600)
+    r.raise_for_status()
+    with open(out_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+    return out_path
+
+
+def _ffprobe_duration(path: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    out = subprocess.check_output(cmd).decode().strip()
+    return float(out)
+
+
+def _concat_with_xfade(video_paths: List[str], out_path: str, fade: float = 0.5) -> str:
+    """
+    variable length videos -> xfade chain.
+    """
+    if len(video_paths) == 1:
+        shutil.copyfile(video_paths[0], out_path)
+        return out_path
+
+    durs = [_ffprobe_duration(v) for v in video_paths]
+
+    cmd = ["ffmpeg", "-y"]
+    for v in video_paths:
+        cmd += ["-i", v]
+
+    filters = []
+    offset = durs[0] - fade
+    filters.append(
+        f"[0:v][1:v]xfade=transition=fade:duration={fade}:offset={offset}[v01]"
+    )
+
+    total = durs[0] + durs[1]
+    prev_label = "v01"
+
+    for i in range(2, len(video_paths)):
+        offset = total - fade * (i)
+        filters.append(
+            f"[{prev_label}][{i}:v]xfade=transition=fade:duration={fade}:offset={offset}[v0{i}]"
+        )
+        prev_label = f"v0{i}"
+        total += durs[i]
+
+    filter_complex = ";".join(filters)
+
+    cmd += [
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        f"[{prev_label}]",
+        "-r",
+        "30",
+        "-pix_fmt",
+        "yuv420p",
+        out_path,
+    ]
+
+    subprocess.check_call(cmd)
+    return out_path
+
+
+def _normalize_scenes_list(plan: Any) -> List[Dict[str, Any]]:
+    """
+    Gemini 응답이 조금씩 흔들릴 수 있어서 안전하게 scenes list를 추출.
+    """
+    if isinstance(plan, dict):
+        if "scenes" in plan and isinstance(plan["scenes"], list):
+            return plan["scenes"]
+        if "ad_plan" in plan and isinstance(plan["ad_plan"], list):
+            return plan["ad_plan"]
+        if all(k in plan for k in ["nano_image_prompt", "video_prompt"]):
+            return [plan]
+        # fallback: try to find any key that is a list
+        for k, v in plan.items():
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                return v
+        raise ValueError("Unexpected plan json structure (missing scenes/ad_plan).")
+    if isinstance(plan, list):
+        return plan
+    raise ValueError("Unexpected plan type")
+
+
+def _get_scene_id(scene: Dict[str, Any], fallback: int) -> int:
+    sid = scene.get("scene_number") or scene.get("id") or fallback
+    try:
+        return int(sid)
+    except Exception:
+        return fallback
+
+
+async def _kie_generate_video(
+    kie_key: str,
+    img_path: str,
+    prompt: str,
+    duration: int = 10,
+    aspect_ratio: str = "9:16"
+) -> str:
+    """KIE Sora 2 API를 사용하여 비디오 생성 (Polling 방식)"""
+    
+    # 이미지 base64 인코딩
+    with open(img_path, "rb") as f:
+        img_base64 = base64.b64encode(f.read()).decode("utf-8")
+        
+    url = "https://api.kie.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {kie_key}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "sora-2-image-to-video-stable",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_base64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "aspect_ratio": aspect_ratio,
+        "duration": duration,
+        "loop": False
+    }
+
+    # 1. 요청 전송
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        # request_id 추출 (응답 구조에 따라 다를 수 있음, video_url이 바로 올 수도 있고 id가 올 수도 있음)
+        # KIE API는 보통 비동기 처리 후 id를 반환하거나, 바로 url을 반환할 수 있음.
+        # 여기서는 app.py의 경험(id 반환 후 polling)을 따름.
+        
+        request_id = data.get("id")
+        if not request_id:
+             # 바로 결과가 온 경우 (동기 처리된 경우)
+             if "choices" in data and len(data["choices"]) > 0:
+                 content = data["choices"][0]["message"]["content"]
+                 try:
+                     res_json = json.loads(content)
+                     return res_json.get("video_url") or res_json.get("url")
+                 except:
+                     return content # URL string
+             # 다른 필드 확인
+             if "video_url" in data: return data["video_url"]
+             if "url" in data: return data["url"]
+             
+             raise ValueError(f"No request_id or video_url in response: {data}")
+             
+    except Exception as e:
+        raise RuntimeError(f"KIE API request failed: {e}")
+
+    # 2. Polling
+    poll_url = f"https://api.kie.ai/v1/request/{request_id}"
+    for _ in range(60): # 최대 5분 대기 (5s * 60)
+        await asyncio.sleep(5)
+        try:
+            p_resp = requests.get(poll_url, headers=headers, timeout=30)
+            if p_resp.status_code != 200:
+                print(f"Polling status {p_resp.status_code}, retrying...")
+                continue
+                
+            p_data = p_resp.json()
+            status = p_data.get("status")
+            
+            if status == "completed":
+                return p_data.get("video_url") or p_data.get("result", {}).get("video_url")
+            elif status == "failed":
+                raise RuntimeError(f"Video generation failed: {p_data.get('error')}")
+            
+            # running or pending, continue waiting
+            
+        except Exception as e:
+            print(f"Polling error: {e}")
+            continue
+
+    raise RuntimeError("Video generation timed out.")
+
+
+# =========================================================
+# Main service function
+# =========================================================
+async def generate_video_for_product(
+    product_id: int,
+    req,
+    product_image: UploadFile,
+) -> Path:
+    """
+    main.py에서 호출하는 비디오 생성 서비스 함수.
+    App.py의 최신 로직(Gemini Multimodal + KIE Sora 2)을 적용.
+    """
+
+    # -----------------------------------------
+    # 0) Env check
+    # -----------------------------------------
+    GEMINI_KEY = os.environ.get("gemini_api_key", "")
+    KIE_API_KEY = os.environ.get("KIE_API_KEY", "")
+
+    if not GEMINI_KEY:
+        raise HTTPException(status_code=500, detail="missing env: gemini_api_key")
+    if not KIE_API_KEY:
+        raise HTTPException(status_code=500, detail="missing env: KIE_API_KEY")
+
+    os.environ["KIE_API_KEY"] = KIE_API_KEY
+    gclient = genai.Client(api_key=GEMINI_KEY)
+
+    # -----------------------------------------
+    # 1) Output dir 결정
+    # -----------------------------------------
+    product_dir = _ensure_product_dir(product_id)
+    out_dir = product_dir
+
+    # -----------------------------------------
+    # 2) Save uploaded image
+    # -----------------------------------------
+    img_bytes = await product_image.read()
+    if not img_bytes:
+        raise HTTPException(status_code=400, detail="empty product_image")
+
+    filename = product_image.filename or "product.png"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in [".png", ".jpg", ".jpeg", ".webp"]:
+        suffix = ".png"
+
+    product_img_path = out_dir / f"product{suffix}"
+    product_img_path.write_bytes(img_bytes)
+
+    ref_mime = mimetypes.guess_type(str(product_img_path))[0] or "image/png"
+    ref_bytes = img_bytes
+
+    # -----------------------------------------
+    # 3) Gemini: Create plan JSON (30초 버전)
+    # -----------------------------------------
+    SYSTEM = """너는 숏츠 광고 감독이다.
+목표: 총 30초 길이의 숏츠 광고를 3개의 씬으로 구성한다. (각 씬 10초)
+핵심: 3개의 씬이 '하나의 영상'처럼 자연스럽게 연결되어야 하며, 등장인물과 제품이 100% 동일해야 한다.
+
+[광고 스토리 구성 - 30초 로드맵]
+Scene 1 (0-10초): 도입 (Hook) - 제품의 매력적인 등장. 로고와 패키지가 선명하게 보여야 함.
+Scene 2 (10-20초): 전개 (Experience) - 사람이 제품을 즐기는 모습. (먹방/음용/사용) 행복한 표정. Scene 1의 제품과 동일해야 함.
+Scene 3 (20-30초): 결말 (End) - 여운이 남는 마무리. 제품 클로즈업 + 페이드아웃 느낌.
+
+[필수]
+- 인물 묘사: '20대 한국 여성, 긴 생머리, 흰 티셔츠' 처럼 구체적으로 정해서 모든 씬에 일관되게 적용해라.
+- 제품 묘사: '빨간색 봉지 라면', '파란색 캔 음료' 등 패키지 특징을 모든 씬에 동일하게 묘사해라.
+"""
+
+    plan_prompt = f"""
+[제품 정보]
+- 식품이름: {req.food_name}
+- 식품종류: {req.food_type}
+- 광고 컨셉: {req.ad_concept}
+- 광고 요구사항: {req.ad_req}
+
+[출력 형식]
+JSON으로만 출력해.
+{{
+  "character_description": "씬 1, 2, 3에 공통으로 등장할 인물의 외모/의상/스타일 묘사 (영어)",
+  "contents_description": "제품 내용물(음식)의 시각적 묘사 (색상, 질감, 모양) (영어)",
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "duration_hint_sec": 10,
+      "scene_script": "한글 스크립트",
+      "nano_image_prompt": "이미지 생성 프롬프트 (영어)",
+      "video_prompt": "영상 생성 프롬프트 (영어)"
+    }},
+    ...
+  ]
+}}
+"""
+
+    try:
+        resp = gclient.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[types.Content(role="user", parts=[types.Part(text=SYSTEM + "\n\n" + plan_prompt)])],
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        plan = json.loads(resp.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"gemini plan generation failed: {e}")
+
+    (out_dir / "video_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    try:
+        scenes_list = _normalize_scenes_list(plan)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"invalid plan json: {e}")
+
+    # 공통 묘사 추출
+    char_desc = plan.get("character_description", "")
+    cont_desc = plan.get("contents_description", "")
+    common_desc = f"Character: {char_desc} | Contents: {cont_desc}" if char_desc or cont_desc else ""
+
+    # -----------------------------------------
+    # 4) Gemini: Generate scene images (Multimodal Chain)
+    # -----------------------------------------
+    STRICT_IMAGE_RULES = """
+[CRITICAL PRIORITY: PRODUCT TEXT & LOGO]
+1. The FIRST image provided is the PRODUCT REFERENCE. The product package text and logo must be IDENTICAL.
+2. Do NOT blur, mistype, or scramble the text. It must be READABLE and SHARP.
+3. If the product is held or eaten, the package design must remain consistent.
+
+[Consistency Rule: CHARACTER]
+The second image provided (if any) is the REFERENCE FOR THE CHARACTER.
+- Use the person from the second image (same face, hair, clothes).
+- BUT DO NOT let the character reference degrade the product quality.
+""".strip()
+
+    img_paths: List[str] = []
+    
+    # 이전 씬 이미지 (캐릭터 일관성 유지용)
+    previous_scene_img_bytes = None
+
+    for idx, sc in enumerate(scenes_list):
+        sid = _get_scene_id(sc, fallback=idx + 1)
+        
+        # 기본 프롬프트 + 공통 묘사
+        base_prompt = sc["nano_image_prompt"].strip()
+        if common_desc:
+            base_prompt = f"[{common_desc}]\n{base_prompt}"
+            
+        content_parts = []
+        
+        # 1. 프롬프트 텍스트
+        prompt_text = base_prompt
+        
+        # 2. 멀티모달 입력 구성
+        # 2-1. 제품 이미지 (항상 첫 번째)
+        content_parts.append(types.Part.from_bytes(data=ref_bytes, mime_type=ref_mime))
+        
+        # 2-2. 이전 씬 이미지 (있으면 두 번째 - 캐릭터 참조용)
+        if previous_scene_img_bytes:
+            content_parts.append(types.Part.from_bytes(data=previous_scene_img_bytes, mime_type="image/png"))
+            prompt_text += "\n\n[Reference Info]:\n- Image 1: PRODUCT (Logo/Text must match exactly).\n- Image 2: CHARACTER (Face/Style must match exactly)."
+        else:
+            prompt_text += "\n\n[Reference Info]: Image 1 is the PRODUCT reference."
+
+        # 최종 프롬프트
+        final_prompt = prompt_text + "\n\n" + STRICT_IMAGE_RULES
+
+        content_parts.insert(0, types.Part(text=final_prompt)) # 텍스트를 맨 앞에
+
+        # API 호출 (재시도 로직 포함)
+        out_bytes = None
+        for attempt in range(3):
+            try:
+                img_resp = gclient.models.generate_content(
+                    model="gemini-2.5-flash-image",
+                    contents=[types.Content(role="user", parts=content_parts)],
+                    config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+                )
+                
+                for p in img_resp.candidates[0].content.parts:
+                    if getattr(p, "inline_data", None) and p.inline_data.mime_type.startswith("image/"):
+                        out_bytes = p.inline_data.data
+                        break
+                
+                if out_bytes: break
+            except Exception as e:
+                print(f"Scene {sid} generation attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(2)
+        
+        if out_bytes is None:
+            raise HTTPException(status_code=500, detail=f"gemini image generation failed after 3 attempts (scene {sid})")
+
+        out_path = out_dir / f"scene_{sid:02d}.png"
+        Image.open(io.BytesIO(out_bytes)).save(out_path)
+        img_paths.append(str(out_path))
+        
+        # 다음 씬을 위해 현재 이미지를 저장 (Scene 1만 저장하여 Scene 2, 3의 기준점으로 사용)
+        if idx == 0:
+            previous_scene_img_bytes = out_bytes
+
+    # -----------------------------------------
+    # 5) KIE Sora 2: Generate scene videos (Async Polling)
+    # -----------------------------------------
+    STRICT_VIDEO_RULES = """
+[CRITICAL VIDEO RULES]
+1. FACE CONSISTENCY: Keep the person's face (eyes, nose, mouth) IDENTICAL to the source image. Do not morph features.
+2. PRODUCT INTEGRITY: Text & Logo on the package must remain READABLE and SHARP. Do not distort.
+3. MOVEMENT: Natural, high-quality cinematic motion.
+""".strip()
+
+    video_paths: List[str] = []
+    
+    for idx, sc in enumerate(scenes_list):
+        sid = _get_scene_id(sc, fallback=idx + 1)
+        duration = sc.get("duration_hint_sec", 10)
+        
+        base_vid_prompt = sc["video_prompt"].strip()
+        if common_desc:
+            base_vid_prompt = f"[{common_desc}]\n{base_vid_prompt}"
+            
+        prompt_vid = (base_vid_prompt + "\n\n" + STRICT_VIDEO_RULES).strip()
+        
+        try:
+            # KIE API 호출 (Polling 포함)
+            video_url = await _kie_generate_video(
+                kie_key=KIE_API_KEY,
+                img_path=img_paths[idx],
+                prompt=prompt_vid,
+                duration=duration,
+                aspect_ratio="9:16"
+            )
+            
+            if not video_url:
+                raise ValueError("No video URL returned")
+
+            out_path = out_dir / f"scene_{sid:02d}.mp4"
+            _download(video_url, out_path)
+            video_paths.append(str(out_path))
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"kie video generation failed (scene {sid}): {e}")
+
+    # -----------------------------------------
+    # 6) FFmpeg: concat with xfade -> final video.mp4
+    # -----------------------------------------
+    final_mp4 = out_dir / "video.mp4"
+    try:
+        _concat_with_xfade(video_paths, str(final_mp4), fade=0.5)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"concat failed: {e}")
+
+    return final_mp4
