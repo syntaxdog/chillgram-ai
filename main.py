@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pathlib import Path
 import shutil
 from typing import Optional
@@ -232,16 +232,14 @@ def analyze_dieline(project_id: int, file: UploadFile = File(...)):
 #   }
 # ===============================================================================================================================================================================================================
 class SNSGenRequest(BaseModel):
-    main_text: str = Field(..., example="나야 새우깡")
-    sub_text: str = Field("", example="바삭함의 정석")
-    preset: Optional[str] = Field(None, example="ocean_sunset")
-    custom_prompt: Optional[str] = Field(
-        None, example="A dramatic night beach scene..."
-    )
-    guideline: Optional[str] = Field(
-        None, example="브랜드 컬러는 빨강과 노랑을 사용하고, 활기찬 느낌을 강조하세요."
-    )
-    save_background: bool = Field(True, example=True)
+    model_config = ConfigDict(populate_by_name=True)
+
+    main_text: str = Field(..., alias="mainText", example="나야 새우깡")
+    sub_text: str = Field("", alias="subText", example="바삭함의 정석")
+    preset: Optional[str] = None
+    custom_prompt: Optional[str] = Field(None, alias="customPrompt", example="A dramatic night beach scene...")
+    guideline: Optional[str] = None
+    save_background: bool = Field(True, alias="saveBackground", example=True)
 
 
 @app.post("/ai/{project_id}/sns")
@@ -274,14 +272,7 @@ def create_sns_image(project_id: int, req: SNSGenRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SNS generation failed: {e}")
 
-    return {
-        "project_id": project_id,
-        "sns_image_url": f"/ai/{project_id}/images/sns",
-        "background_image_url": (
-            f"/ai/{project_id}/images/sns_background" if req.save_background else None
-        ),
-        "output_path": str(final_path),
-    }
+    return FileResponse(final_path, media_type="image/png", filename="sns.png")
 
 
 
