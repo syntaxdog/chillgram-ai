@@ -1,0 +1,76 @@
+name: Deploy Python Worker to GCP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup Google Cloud CLI
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        service_account_key: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+    
+    - name: Deploy to VM
+      run: |
+        gcloud compute ssh chillgram-pythonworker \
+          --zone=us-west1-b \
+          --tunnel-through-iap \
+          --command='
+            set -e
+            
+            echo "🚀 Starting deployment..."
+            
+            cd ~
+            rm -rf CHILLGRAM_AI
+            
+            echo "📥 Cloning repository..."
+            git clone https://github.com/${{ github.repository }}.git CHILLGRAM_AI
+            cd CHILLGRAM_AI
+            
+            echo "📝 Creating .env file..."
+            cat > .env << "ENV_EOF"
+        ${{ secrets.ENV_FILE }}
+        ENV_EOF
+            
+            echo "🔑 Creating GCS credentials..."
+            cat > gcloud-key.json << "JSON_EOF"
+        ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        JSON_EOF
+            
+            echo "🐳 Building Docker image..."
+            sudo docker build -t python-worker .
+            
+            echo "🛑 Stopping old container..."
+            sudo docker stop python-worker 2>/dev/null || true
+            sudo docker rm python-worker 2>/dev/null || true
+            
+            echo "▶️ Starting new container..."
+            sudo docker run -d \
+              --name python-worker \
+              --restart always \
+              -v $(pwd)/ai:/app/ai \
+              python-worker
+            
+            echo "📋 Container logs:"
+            sleep 3
+            sudo docker logs python-worker --tail 20
+            
+            echo "✅ Deployment complete!"
+          '
+    
+    - name: Verify Deployment
+      run: |
+        echo "🔍 Checking container status..."
+        gcloud compute ssh chillgram-pythonworker \
+          --zone=us-west1-b \
+          --tunnel-through-iap \
+          --command='sudo docker ps | grep python-worker'
