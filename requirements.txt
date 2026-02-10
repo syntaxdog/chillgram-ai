@@ -4,3 +4,4 @@ pillow
 torch
 numpy
 opencv-python
+python-dotenv
