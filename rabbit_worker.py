@@ -90,33 +90,36 @@ def gcs_upload(local_path: Path, object_name: str) -> str:
 
 
 async def handle_job(message: aio_pika.IncomingMessage):
-    async with message.process(requeue=False):
-        body = message.body.decode("utf-8")
-        job = json.loads(body)
+    try:
+        async with message.process(requeue=False):
+            body = message.body.decode("utf-8")
+            job = json.loads(body)
 
-        project_id = int(job["projectId"])
-        job_type = job["jobType"]
-        payload = job.get("payload", {}) or {}
+            project_id = int(job["projectId"])
+            job_type = str(job.get("jobType", "")).upper()
+            payload = job.get("payload", {}) or {}
 
-        # 1) 생성
-        if job_type == "banner":
-            out = job_banner(project_id, payload)
-            obj = f"{project_id}/banner.png"
-        elif job_type == "sns":
-            out = job_sns(project_id, payload)
-            obj = f"{project_id}/sns.png"
-        elif job_type == "video":
-            out = await job_video(project_id, payload)
-            obj = f"{project_id}/video.mp4"
-        else:
-            raise ValueError(f"unsupported jobType: {job_type}")
+            # 1) 생성
+            if job_type == "BANNER":
+                out = job_banner(project_id, payload)
+                obj = f"{project_id}/banner.png"
+            elif job_type == "SNS":
+                out = job_sns(project_id, payload)
+                obj = f"{project_id}/sns.png"
+            elif job_type == "VIDEO":
+                out = await job_video(project_id, payload)
+                obj = f"{project_id}/video.mp4"
+            else:
+                raise ValueError(f"unsupported jobType: {job_type}")
 
-        # 2) GCS 업로드
-        gs_uri = gcs_upload(out, obj)
+            # 2) GCS 업로드
+            gs_uri = gcs_upload(out, obj)
 
-        # 3) TODO: 결과 이벤트 발행 / 상태 저장 (Spring이 읽게)
-        print(json.dumps({"ok": True, "jobType": job_type, "projectId": project_id, "output": gs_uri}, ensure_ascii=False))
-
+            # 3) TODO: 결과 이벤트 발행 / 상태 저장 (Spring이 읽게)
+            print(json.dumps({"ok": True, "jobType": job_type, "projectId": project_id, "output": gs_uri}, ensure_ascii=False))
+    except Exception as e:
+        print(f"[JOB ERROR] {e}", flush=True)
+        raise
 
 async def main():
     print(f"Starting RabbitMQ consumer: {RABBITMQ_URL} queue={QUEUE_NAME}")
