@@ -44,13 +44,19 @@ jobs:
             
             echo "📝 Creating .env file..."
             cat > .env << "ENV_EOF"
-        ${{ secrets.ENV_FILE }}
-        ENV_EOF
+            ${{ secrets.ENV_FILE }}
+            ENV_EOF
             
-            echo "🔑 Creating GCS credentials..."
-            cat > gcloud-key.json << "JSON_EOF"
-        ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-        JSON_EOF
+             # gcloud-key.json 생성
+            echo "🔑  Creating GCS credentials..."
+            sudo mkdir -p /opt/chillgram/secrets
+            sudo chmod 700 /opt/chillgram/secrets
+
+            sudo tee /opt/chillgram/secrets/gcs.json > /dev/null << "JSON_EOF"
+            ${{ secrets.GCP_WORKER_SA_KEY_JSON }}
+            JSON_EOF
+
+            sudo chmod 600 /opt/chillgram/secrets/gcs.json
             
             echo "🐳 Building Docker image..."
             sudo docker build -t python-worker .
@@ -63,7 +69,10 @@ jobs:
             sudo docker run -d \
               --name python-worker \
               --restart always \
+              --env-file $(pwd)/.env \
               -v $(pwd)/ai:/app/ai \
+              -v /opt/chillgram/secrets/gcs.json:/secrets/gcs.json:ro \
+              -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs.json \
               python-worker
             
             echo "📋 Container logs:"
