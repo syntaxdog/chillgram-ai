@@ -18,4 +18,3 @@ aio-pika==9.5.3
 # Google Cloud Storage (영상 저장용)
 google-cloud-storage==2.19.0
 
-aio-pika==9.4.3
