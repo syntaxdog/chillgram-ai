@@ -73,7 +73,7 @@ jobs:
               -v $(pwd)/ai:/app/ai \
               -v /opt/chillgram/secrets/gcs.json:/secrets/gcs.json:ro \
               -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs.json \
-              python-worker
+              python-worker || echo "DOCKER RUN FAILED"
             
             echo "📋 Container logs:"
             sleep 3
