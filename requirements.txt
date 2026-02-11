@@ -1,0 +1,19 @@
+#uvicorn[standard]
+#torch
+
+# Image Processing
+Pillow==11.0.0
+opencv-python==4.10.0.84
+numpy==2.2.1
+rembg==2.0.59
+
+# Google AI (Gemini)
+google-genai==1.62.0
+# Replicate (Video Generation)
+replicate==1.0.4
+# Environment Variables
+python-dotenv==1.0.1
+# RabbitMQ (비동기 작업 큐) - 워커용
+aio-pika==9.5.3
+# Google Cloud Storage (영상 저장용)
+google-cloud-storage==2.19.0

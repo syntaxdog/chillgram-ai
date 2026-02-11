@@ -1,0 +1,105 @@
+name: Deploy Python Worker to GCP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Set GCP Project
+      run: |
+        gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Deploy to VM
+      run: |
+        gcloud compute ssh chillgram-pythonworker \
+          --zone=us-west1-b \
+          --tunnel-through-iap \
+          --command='
+            set -e
+            
+            echo "🚀 Starting deployment..."
+            
+            cd ~
+            rm -rf CHILLGRAM_AI
+            
+            echo "📥 Cloning repository..."
+            git clone https://github.com/${{ github.repository }}.git CHILLGRAM_AI
+            cd CHILLGRAM_AI
+        
+            echo "📝 Creating .env file..."
+            echo "${{ secrets.ENV_FILE }}" | sudo tee .env > /dev/null
+            sudo chmod 600 .env
+
+            echo "🔑 Creating GCS credentials..."
+            sudo mkdir -p /opt/chillgram/secrets
+            sudo chmod 700 /opt/chillgram/secrets
+            echo '\''${{ secrets.GCP_WORKER_SA_KEY_JSON }}'\'' | sudo tee /opt/chillgram/secrets/gcs.json > /dev/null
+            sudo chmod 600 /opt/chillgram/secrets/gcs.json
+
+            echo "== DEBUG CHECK =="
+            echo "pwd=$(pwd)"
+            sudo ls -al .env || true
+            sudo ls -al /opt/chillgram/secrets || true
+            
+            echo "🐳 Building Docker image..."
+            sudo docker build -t python-worker .
+            
+            echo "🛑 Stopping old container..."
+            sudo docker stop python-worker 2>/dev/null || true
+            sudo docker rm python-worker 2>/dev/null || true
+            
+            echo "▶️ Starting new container..."
+            sudo docker run -d \
+              --name python-worker \
+              --restart always \
+              --env-file $(pwd)/.env \
+              -v $(pwd)/ai:/app/ai \
+              -v /opt/chillgram/secrets/gcs.json:/secrets/gcs.json:ro \
+              -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs.json \
+              python-worker || echo "DOCKER RUN FAILED"
+            
+            echo "📋 Container logs:"
+            sleep 3
+            sudo docker logs python-worker --tail 20
+            
+            echo "✅ Deployment complete!"
+          '
+
+    - name: Verify Deployment
+      run: |
+        echo "🔍 Checking container status..."
+        gcloud compute ssh chillgram-pythonworker \
+          --zone=us-west1-b \
+          --tunnel-through-iap \
+          --command='
+            set -e
+            echo "== docker ps (filtered) =="
+            sudo docker ps --filter "name=^/python-worker$" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+
+            if sudo docker ps --filter "name=^/python-worker$" --format "{{.Names}}" | grep -qx "python-worker"; then
+              echo "✅ python-worker is running"
+            else
+              echo "❌ python-worker is NOT running"
+              echo "== docker ps -a (filtered) =="
+              sudo docker ps -a --filter "name=^/python-worker$" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+              echo "== last logs =="
+              sudo docker logs python-worker --tail 200 || true
+              exit 1
+            fi
+          '
