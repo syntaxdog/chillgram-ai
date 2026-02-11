@@ -41,22 +41,21 @@ jobs:
             echo "📥 Cloning repository..."
             git clone https://github.com/${{ github.repository }}.git CHILLGRAM_AI
             cd CHILLGRAM_AI
-            
+        
             echo "📝 Creating .env file..."
-            cat > .env << "ENV_EOF"
-            ${{ secrets.ENV_FILE }}
-            ENV_EOF
-            
-             # gcloud-key.json 생성
-            echo "🔑  Creating GCS credentials..."
+            echo "${{ secrets.ENV_FILE }}" | sudo tee .env > /dev/null
+            sudo chmod 600 .env
+
+            echo "🔑 Creating GCS credentials..."
             sudo mkdir -p /opt/chillgram/secrets
             sudo chmod 700 /opt/chillgram/secrets
-
-            sudo tee /opt/chillgram/secrets/gcs.json > /dev/null << "JSON_EOF"
-            ${{ secrets.GCP_WORKER_SA_KEY_JSON }}
-            JSON_EOF
-
+            echo '\''${{ secrets.GCP_WORKER_SA_KEY_JSON }}'\'' | sudo tee /opt/chillgram/secrets/gcs.json > /dev/null
             sudo chmod 600 /opt/chillgram/secrets/gcs.json
+
+            echo "== DEBUG CHECK =="
+            echo "pwd=$(pwd)"
+            sudo ls -al .env || true
+            sudo ls -al /opt/chillgram/secrets || true
             
             echo "🐳 Building Docker image..."
             sudo docker build -t python-worker .
