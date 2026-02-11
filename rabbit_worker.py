@@ -15,10 +15,9 @@ load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
-QUEUE_NAME = os.getenv("RABBITMQ_QUEUE", "chillgram.jobs")
-
-GCS_BUCKET = os.getenv("GCS_BUCKET", "chillgram-image-videos")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "")
+QUEUE_NAME = os.getenv("RABBITMQ_QUEUE", "")
+GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 
 BASE_DIR = Path(__file__).resolve().parent
 AI_DIR = BASE_DIR / "ai"
