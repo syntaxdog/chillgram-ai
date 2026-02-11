@@ -2,10 +2,12 @@ import asyncio
 import json
 import os
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import aio_pika
+from aio_pika import DeliveryMode, Message, IncomingMessage
 from dotenv import load_dotenv
 from google.cloud import storage
 
@@ -15,44 +17,55 @@ from services.video_generate import generate_video_for_product
 
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "")
-QUEUE_NAME = os.getenv("RABBITMQ_QUEUE", "")
-GCS_BUCKET = os.getenv("GCS_BUCKET", "")
+@dataclass(frozen=True)
+class Env:
+    api_key: str
+    rabbitmq_url: str
+    queue_jobs: str
+    queue_results: str
+    gcs_bucket: str
+
+
+def load_env() -> Env:
+    return Env(
+        api_key=os.getenv("GEMINI_API_KEY", ""),
+        rabbitmq_url=os.getenv("RABBITMQ_URL", ""),
+        queue_jobs=os.getenv("RABBITMQ_QUEUE", ""),
+        queue_results=os.getenv("RABBITMQ_RESULT_QUEUE", "chillgram.job-results"),
+        gcs_bucket=os.getenv("GCS_BUCKET", ""),
+    )
+
 
 BASE_DIR = Path(__file__).resolve().parent
 AI_DIR = BASE_DIR / "ai"
 
 
-def ensure_product_dir(project_id: int) -> Path:
+def ensure_project_dir(project_id: int) -> Path:
     d = AI_DIR / str(project_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def pick(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
-    """Return first existing non-None key among candidates."""
     for k in keys:
         if k in d and d[k] is not None:
             return d[k]
     return default
 
 
-def parse_job(body: str) -> Dict[str, Any]:
+def parse_job_message(raw: str) -> Dict[str, Any]:
     """
     Supports:
-    1) Plain job:
-       {"projectId":1,"jobType":"BANNER","payload":{...}}
-    2) Debezium outbox envelope:
-       {"schema":{...},"payload":"{...job json...}"}
-       or payload as dict (rare)
+    - Plain job JSON (most likely with Debezium outbox router)
+    - Debezium envelope:
+      {"schema":{...},"payload":"{...job json...}"}
     """
-    outer = json.loads(body)
+    outer = json.loads(raw)
 
-    if isinstance(outer, dict) and "payload" in outer and "schema" in outer:
-        inner = outer.get("payload")
-        # Debezium payload is often a JSON string
+    # Debezium envelope
+    if isinstance(outer, dict) and "schema" in outer and "payload" in outer:
+        inner = outer["payload"]
         if isinstance(inner, str):
             return json.loads(inner)
         if isinstance(inner, dict):
@@ -66,15 +79,13 @@ def parse_job(body: str) -> Dict[str, Any]:
 
 
 def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Accept both snake_case and camelCase payload fields.
-    Return a normalized snake_case payload for internal job_* functions.
-    """
+    job_type = job_type.upper()
+
     if job_type == "BANNER":
         headline = pick(payload, "headline")
         typo_text = pick(payload, "typo_text", "typoText")
         if not headline or not typo_text:
-            raise ValueError(f"BANNER payload missing fields: headline={headline}, typo_text={typo_text}")
+            raise ValueError(f"BANNER payload missing: headline={headline}, typoText={typo_text}")
         return {"headline": headline, "typo_text": typo_text}
 
     if job_type == "SNS":
@@ -86,7 +97,7 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         save_background = pick(payload, "save_background", "saveBackground", default=True)
 
         if not main_text:
-            raise ValueError("SNS payload missing field: main_text/mainText")
+            raise ValueError("SNS payload missing: mainText/main_text")
 
         return {
             "main_text": main_text,
@@ -98,141 +109,182 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if job_type == "VIDEO":
-        # 영상은 지금 너 코드상 payload 그대로 req로 넘기고 있으니 일단 패스(원하면 여기도 정규화 가능)
         return payload
 
     return payload
 
 
-def job_banner(project_id: int, payload: Dict[str, Any]) -> Path:
-    product_dir = ensure_product_dir(project_id)
-    input_path = product_dir / "package.png"
-    output_path = product_dir / "banner.png"
+class GcsUploader:
+    def __init__(self, bucket: str):
+        if not bucket:
+            raise ValueError("GCS_BUCKET is empty")
+        self.bucket_name = bucket
+        self.client = storage.Client()
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"{input_path} not found (package.png is required)")
-
-    gen = AdBannerGenerator(api_key=API_KEY)
-    gen.process(
-        image_path=str(input_path),
-        headline=payload["headline"],
-        typo_text=payload["typo_text"],
-        output_path=str(output_path),
-    )
-    return output_path
+    def upload(self, local_path: Path, object_name: str) -> str:
+        bucket = self.client.bucket(self.bucket_name)
+        blob = bucket.blob(object_name)
+        blob.upload_from_filename(str(local_path))
+        return f"gs://{self.bucket_name}/{object_name}"
 
 
-def job_sns(project_id: int, payload: Dict[str, Any]) -> Path:
-    product_dir = ensure_product_dir(project_id)
-    product_path = product_dir / "package.png"
-    if not product_path.exists():
-        raise FileNotFoundError("package.png not found. Upload/generate package first.")
+class JobRunner:
+    def __init__(self, api_key: str, uploader: GcsUploader):
+        self.api_key = api_key
+        self.uploader = uploader
 
-    background_path = product_dir / "sns_background.png"
-    final_path = product_dir / "sns.png"
+    def run_banner(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
+        d = ensure_project_dir(project_id)
+        input_path = d / "package.png"
+        output_path = d / "banner.png"
 
-    gen = SNSImageGenerator()
-    gen.generate(
-        product_path=str(product_path),
-        main_text=payload["main_text"],
-        sub_text=payload.get("sub_text", "") or "",
-        preset=payload.get("preset"),
-        custom_prompt=payload.get("custom_prompt"),
-        guideline=payload.get("guideline"),
-        output_path=str(final_path),
-        save_background=payload.get("save_background", True),
-        background_output_path=str(background_path) if payload.get("save_background", True) else None,
-    )
-    return final_path
+        if not input_path.exists():
+            raise FileNotFoundError(f"{input_path} not found (package.png required)")
+
+        gen = AdBannerGenerator(api_key=self.api_key)
+        gen.process(
+            image_path=str(input_path),
+            headline=payload["headline"],
+            typo_text=payload["typo_text"],
+            output_path=str(output_path),
+        )
+        return output_path, f"{project_id}/banner.png"
+
+    def run_sns(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
+        d = ensure_project_dir(project_id)
+        product_path = d / "package.png"
+        if not product_path.exists():
+            raise FileNotFoundError("package.png not found. Upload/generate package first.")
+
+        background_path = d / "sns_background.png"
+        final_path = d / "sns.png"
+
+        gen = SNSImageGenerator()
+        gen.generate(
+            product_path=str(product_path),
+            main_text=payload["main_text"],
+            sub_text=payload.get("sub_text", "") or "",
+            preset=payload.get("preset"),
+            custom_prompt=payload.get("custom_prompt"),
+            guideline=payload.get("guideline"),
+            output_path=str(final_path),
+            save_background=payload.get("save_background", True),
+            background_output_path=str(background_path) if payload.get("save_background", True) else None,
+        )
+        return final_path, f"{project_id}/sns.png"
+
+    async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
+        out = await generate_video_for_product(project_id=project_id, req=payload, product_image=None)
+        return Path(out), f"{project_id}/video.mp4"
+
+    async def execute(self, job: Dict[str, Any]) -> str:
+        job_type = str(job.get("jobType", "")).upper()
+        project_id = int(job["projectId"])
+        payload = job.get("payload") or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"payload must be object, got {type(payload)}")
+
+        payload_norm = normalize_payload(job_type, payload)
+
+        if job_type == "BANNER":
+            local_path, obj = self.run_banner(project_id, payload_norm)
+        elif job_type == "SNS":
+            local_path, obj = self.run_sns(project_id, payload_norm)
+        elif job_type == "VIDEO":
+            local_path, obj = await self.run_video(project_id, payload_norm)
+        else:
+            raise ValueError(f"unsupported jobType: {job_type}")
+
+        return self.uploader.upload(local_path, obj)
 
 
-async def job_video(project_id: int, payload: Dict[str, Any]) -> Path:
-    out = await generate_video_for_product(project_id=project_id, req=payload, product_image=None)
-    return Path(out)
+class ResultPublisher:
+    def __init__(self, channel: aio_pika.Channel, result_queue: str):
+        self.channel = channel
+        self.result_queue = result_queue
+
+    async def publish(self, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        msg = Message(
+            body=body,
+            content_type="application/json",
+            delivery_mode=DeliveryMode.PERSISTENT,
+        )
+        await self.channel.default_exchange.publish(msg, routing_key=self.result_queue)
 
 
-def gcs_upload(local_path: Path, object_name: str) -> str:
-    """
-    returns gs://bucket/object
-    """
-    if not GCS_BUCKET:
-        raise ValueError("GCS_BUCKET is empty")
-
-    client = storage.Client()
-    bucket = client.bucket(GCS_BUCKET)
-    blob = bucket.blob(object_name)
-    blob.upload_from_filename(str(local_path))
-    return f"gs://{GCS_BUCKET}/{object_name}"
-
-
-async def handle_job(message: aio_pika.IncomingMessage):
-    raw = message.body.decode("utf-8", errors="replace")
+async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPublisher):
+    raw = msg.body.decode("utf-8", errors="replace")
     print(f"[RECEIVED] {raw}", flush=True)
 
-    async with message.process(requeue=False):
+    async with msg.process(requeue=False):
+        job_id = ""
         try:
-            job = parse_job(raw)
+            job = parse_job_message(raw)
 
-            # projectId는 Debezium inner payload 안에 있음(파싱 후 job에서 읽힘)
-            project_id = int(job["projectId"])
-            job_type = str(job.get("jobType", "")).upper()
-            payload = job.get("payload") or {}
+            job_id = str(job.get("jobId") or "").strip()
+            if not job_id:
+                raise ValueError("jobId is empty")
 
-            if not job_type:
-                raise ValueError("jobType is empty")
-            if not isinstance(payload, dict):
-                raise ValueError(f"payload must be object, got {type(payload)}")
+            # 실행
+            gs_uri = await runner.execute(job)
 
-            payload_norm = normalize_payload(job_type, payload)
+            # 성공 결과
+            await pub.publish({
+                "jobId": job_id,
+                "success": True,
+                "outputUri": gs_uri,
+                "errorCode": None,
+                "errorMessage": None,
+            })
 
-            # 1) 생성
-            if job_type == "BANNER":
-                out = job_banner(project_id, payload_norm)
-                obj = f"{project_id}/banner.png"
-            elif job_type == "SNS":
-                out = job_sns(project_id, payload_norm)
-                obj = f"{project_id}/sns.png"
-            elif job_type == "VIDEO":
-                out = await job_video(project_id, payload_norm)
-                obj = f"{project_id}/video.mp4"
-            else:
-                raise ValueError(f"unsupported jobType: {job_type}")
+            print(json.dumps({"ok": True, "jobId": job_id, "output": gs_uri}, ensure_ascii=False), flush=True)
 
-            # 2) GCS 업로드
-            gs_uri = gcs_upload(out, obj)
-
-            # 3) 로그(최소)
-            print(
-                json.dumps(
-                    {"ok": True, "jobType": job_type, "projectId": project_id, "output": gs_uri},
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-
-        except Exception:
+        except Exception as e:
             print("[JOB ERROR] job failed", flush=True)
             traceback.print_exc()
-            # raise 해야 message.process가 reject 처리(현재 requeue=False라 DLQ 없으면 드랍)
-            raise
+
+            # 실패 결과(best effort)
+            try:
+                await pub.publish({
+                    "jobId": job_id,
+                    "success": False,
+                    "outputUri": None,
+                    "errorCode": "WORKER_FAILED",
+                    "errorMessage": str(e) if e else "unknown error",
+                })
+            except Exception:
+                print("[RESULT PUBLISH ERROR] failed to publish job result", flush=True)
+                traceback.print_exc()
 
 
 async def main():
-    if not RABBITMQ_URL:
+    env = load_env()
+    if not env.rabbitmq_url:
         raise ValueError("RABBITMQ_URL is empty")
-    if not QUEUE_NAME:
+    if not env.queue_jobs:
         raise ValueError("RABBITMQ_QUEUE is empty")
 
-    print(f"Starting RabbitMQ consumer: {RABBITMQ_URL} queue={QUEUE_NAME}", flush=True)
+    print(
+        f"Starting consumer: url={env.rabbitmq_url} jobs={env.queue_jobs} results={env.queue_results}",
+        flush=True,
+    )
 
-    connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    connection = await aio_pika.connect_robust(env.rabbitmq_url)
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)
 
-    queue = await channel.declare_queue(QUEUE_NAME, durable=True)
-    await queue.consume(handle_job)
+    # queues
+    await channel.declare_queue(env.queue_jobs, durable=True)
+    await channel.declare_queue(env.queue_results, durable=True)
 
-    # keep running
+    uploader = GcsUploader(env.gcs_bucket)
+    runner = JobRunner(env.api_key, uploader)
+    publisher = ResultPublisher(channel, env.queue_results)
+
+    q = await channel.get_queue(env.queue_jobs)
+    await q.consume(lambda m: handle_message(m, runner, publisher))
+
     await asyncio.Future()
 
 
