@@ -12,8 +12,6 @@ from typing import Any, Dict, List
 
 import requests
 from PIL import Image
-from fastapi import UploadFile, HTTPException
-
 from google import genai
 from google.genai import types
 import replicate
