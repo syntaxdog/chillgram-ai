@@ -248,6 +248,16 @@ class JobRunner:
         return output_path, f"{project_id}/package.png"
 
 
+class BytesFile:
+    """FastAPI UploadFile adapter for local files (Async compatible)."""
+    def __init__(self, filename: str, data: bytes):
+        self.filename = filename
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
         """
         main.py의 /ai/{project_id}/video 처럼:
@@ -260,22 +270,18 @@ class JobRunner:
         if not package_path.exists():
             raise FileNotFoundError("package.png not found. VIDEO requires package.png in ai/{projectId}/")
 
-        f = package_path.open("rb")
-        try:
-            upload = UploadFile(filename="package.png", file=f)
-            # generate_video_for_product가 내부에서 content_type을 검사한다면 아래 줄 추가 가능:
-            # upload.content_type = "image/png"  # fastapi UploadFile은 속성 세터가 애매할 수 있음
+        # 비동기 처리를 위해 바이너리로 읽어서 BytesFile로 포장
+        # (파일이 아주 크다면 aiofiles를 고려해야 하지만, 여기선 package.png 정도라 무방)
+        with open(package_path, "rb") as f:
+            file_bytes = f.read()
 
-            # 무한 대기 방지 (필수)
-            out = await asyncio.wait_for(
-                generate_video_for_product(project_id=project_id, req=payload, product_image=upload),
-                timeout=self.video_timeout_sec,
-            )
-        finally:
-            try:
-                f.close()
-            except Exception:
-                pass
+        upload_adapter = BytesFile(filename="package.png", data=file_bytes)
+
+        # 무한 대기 방지 (필수)
+        out = await asyncio.wait_for(
+            generate_video_for_product(product_id=project_id, req=payload, product_image=upload_adapter),
+            timeout=self.video_timeout_sec,
+        )
 
         out_path = Path(out)
         return out_path, f"{project_id}/video.mp4"
