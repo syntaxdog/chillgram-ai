@@ -13,9 +13,30 @@ from google.cloud import storage
 
 from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
-from services.video_generate import generate_video_for_product
+from services.video_2 import generate_video_for_product
 
 load_dotenv()
+
+
+class BytesFile:
+    """FastAPI UploadFile adapter for local files."""
+    def __init__(self, filename: str, data: bytes):
+        self.filename = filename
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+
+class PayloadObj:
+    """Simple adapter to access dict keys as attributes."""
+    def __init__(self, data: Dict[str, Any]):
+        self.__dict__.update(data)
+        # Ensure required attributes exist with defaults if missing
+        if not hasattr(self, 'food_name'): self.food_name = "Product"
+        if not hasattr(self, 'food_type'): self.food_type = "Food"
+        if not hasattr(self, 'ad_concept'): self.ad_concept = "Deletecious"
+        if not hasattr(self, 'ad_req'): self.ad_req = "Make it look good"
 
 
 @dataclass(frozen=True)
@@ -174,7 +195,23 @@ class JobRunner:
         return final_path, f"{project_id}/sns.png"
 
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
-        out = await generate_video_for_product(project_id=project_id, req=payload, product_image=None)
+        # 1. 이미지가 있어야 함 (package.png)
+        d = ensure_project_dir(project_id)
+        product_path = d / "package.png"
+        
+        if not product_path.exists():
+             raise FileNotFoundError(f"{product_path} not found. Package image is required for video.")
+
+        # 2. File Adapter 생성
+        with open(product_path, "rb") as f:
+            img_bytes = f.read()
+        product_image = BytesFile("package.png", img_bytes)
+        
+        # 3. Request Adapter 생성
+        req_obj = PayloadObj(payload)
+
+        # 4. Video Generator 호출
+        out = await generate_video_for_product(product_id=project_id, req=req_obj, product_image=product_image)
         return Path(out), f"{project_id}/video.mp4"
 
     async def execute(self, job: Dict[str, Any]) -> str:
