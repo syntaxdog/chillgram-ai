@@ -362,11 +362,13 @@ async def generate_video_for_product(product_id: int, req: Any, product_image: U
     gclient = genai.Client(api_key=gemini_key)
     out_dir = _ensure_product_dir(product_id)
     
-    # 1. Save Uploaded Image
-    if hasattr(product_image, "read"):
+    # 1. Save Image (Supports UploadFile-like or raw bytes)
+    if isinstance(product_image, bytes):
+        img_bytes = product_image
+    elif hasattr(product_image, "read"):
         img_bytes = await product_image.read()
     else:
-        raise ValueError("Invalid product_image type")
+        raise ValueError("Invalid product_image type. Expected bytes or UploadFile-like object.")
         
     product_img_path = out_dir / f"product-{int(time.time())}.png"
     with open(product_img_path, "wb") as f: f.write(img_bytes)

@@ -23,14 +23,7 @@ from services.dieline_generate import DielineGenerator
 
 load_dotenv()
 
-class BytesFile:
-    """FastAPI UploadFile adapter for local files (Async compatible)."""
-    def __init__(self, filename: str, data: bytes):
-        self.filename = filename
-        self._data = data
 
-    async def read(self) -> bytes:
-        return self._data
 
 
 # =========================
@@ -315,16 +308,13 @@ class JobRunner:
         if not package_path.exists():
             raise FileNotFoundError("package.png not found. VIDEO requires package.png in ai/{projectId}/")
 
-        # 비동기 처리를 위해 바이너리로 읽어서 BytesFile로 포장
-        # (파일이 아주 크다면 aiofiles를 고려해야 하지만, 여기선 package.png 정도라 무방)
+        # 직접 바이너리 데이터로 넘긴다 (video_2.py에서 처리 가능)
         with open(package_path, "rb") as f:
             file_bytes = f.read()
 
-        upload_adapter = BytesFile(filename="package.png", data=file_bytes)
-
         # 무한 대기 방지 (필수)
         out = await asyncio.wait_for(
-            generate_video_for_product(product_id=project_id, req=payload, product_image=upload_adapter),
+            generate_video_for_product(product_id=project_id, req=payload, product_image=file_bytes),
             timeout=self.video_timeout_sec,
         )
 
