@@ -284,50 +284,6 @@ class JobRunner:
         out_path = Path(out)
         return out_path, f"{project_id}/video.mp4"
 
-    def run_package(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
-        """
-        main.py create_package_with_gemini의 핵심만 worker로 옮긴 최소 구현.
-        payload에서 로컬 파일 경로로 dieline/concept을 받아 ai/{project_id}/에 복사 후 파이프라인 실행.
-        """
-        d = ensure_project_dir(project_id)
-        dieline_src = Path(payload["dieline_path"])
-        concept_src = Path(payload["concept_path"])
-        instruction = payload.get("instruction", "") or ""
-
-        if not dieline_src.exists():
-            raise FileNotFoundError(f"dieline_path not found: {dieline_src}")
-        if not concept_src.exists():
-            raise FileNotFoundError(f"concept_path not found: {concept_src}")
-
-        dieline_path = d / "dieline_input.png"
-        concept_path = d / "concept_input.png"
-        dieline_path.write_bytes(dieline_src.read_bytes())
-        concept_path.write_bytes(concept_src.read_bytes())
-
-        generated_temp_path = Path("FINAL_RESULT4.png")
-        final_output_path = d / "package.png"
-
-        # GeminiPlease 파이프라인 실행
-        import GeminiPlease
-        GeminiPlease.run_final_natural_pipeline(str(dieline_path.resolve()), str(concept_path.resolve()))
-
-        if generated_temp_path.exists():
-            # 결과 이동
-            final_output_path.write_bytes(generated_temp_path.read_bytes())
-            try:
-                generated_temp_path.unlink()
-            except Exception:
-                pass
-        else:
-            raise FileNotFoundError("Generation script finished but no output found (FINAL_RESULT4.png).")
-
-        # (옵션) instruction edit는 네 main.py가 package_generate를 부르지만
-        # worker 이미지에 그 모듈이 없을 수 있어 여기서는 생략/확장 포인트로 둔다.
-        # 필요하면 PackageGenerator 적용 로직을 그대로 이쪽에 추가하면 됨.
-        _ = instruction  # unused
-
-        return final_output_path, f"{project_id}/package.png"
-
     async def execute(self, job: Dict[str, Any]) -> str:
         job_type = str(job.get("jobType", "")).upper()
         project_id = int(job["projectId"])
