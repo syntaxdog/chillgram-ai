@@ -11,8 +11,7 @@ from aio_pika import DeliveryMode, Message, IncomingMessage
 from dotenv import load_dotenv
 from google.cloud import storage
 
-# FastAPI UploadFile 래핑용 (worker 이미지에 fastapi가 있어야 함)
-from fastapi import UploadFile
+
 
 from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
@@ -242,8 +241,8 @@ class JobRunner:
             )
 
         except Exception as e:
-            print(f"Error generation package: {e}")
-            raise HTTPException(status_code=500, detail=f"package generation failed: {e}")
+            print(f"[PackageGenerator] generation error: {e}")
+            raise RuntimeError(f"package generation failed: {e}") from e
 
         # 5. 생성된 이미지 반환
         return output_path, f"{project_id}/package.png"
