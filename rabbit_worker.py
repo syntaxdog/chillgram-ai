@@ -141,17 +141,13 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if jt == "PACKAGE":
-        # worker에서 package 생성까지 하고 싶다면 payload 정의 필요
-        # 최소: dieline_path / concept_path 로컬 경로, 또는 GCS URI 다운로드 로직을 추가해야 함.
-        # 여기서는 로컬 파일 경로를 받는 최소 형태로만 구현.
-        dieline_local = pick(payload, "dieline_path", "dielinePath")
-        concept_local = pick(payload, "concept_path", "conceptPath")
-        instruction = pick(payload, "instruction", default="")
-
-        if not dieline_local or not concept_local:
-            raise ValueError("PACKAGE payload missing: dieline_path/dielinePath and concept_path/conceptPath")
-        return {"dieline_path": dieline_local, "concept_path": concept_local, "instruction": instruction}
-
+        prompt = pick(payload, "prompt", "instruction")
+        if not prompt:
+            raise ValueError("PACKAGE payload missing: prompt/instruction")
+    
+        return {
+            "prompt": prompt
+        }
     return payload
 
 
@@ -221,31 +217,41 @@ class JobRunner:
         )
         return final_path, f"{project_id}/sns.png"
 
-    def run_package(
-        project_id: int,
-        instruction: str = Form(...),
-    ):
-        product_dir = ensure_product_dir(project_id)
-
+    def run_package(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
+        """
+        INPUT:
+          ai/{projectId}/package_input.png
+        OUTPUT:
+          ai/{projectId}/package.png
+        """
+    
+        product_dir = ensure_project_dir(project_id)
+    
         input_path = product_dir / "package_input.png"
-
-        # 3. 결과 저장 경로
         output_path = product_dir / "package.png"
-
-        # 4. Gemini 호출
+    
+        if not input_path.exists():
+            raise FileNotFoundError(
+                f"{input_path} not found (PACKAGE requires package_input.png)"
+            )
+    
+        prompt = payload["prompt"]
+    
         try:
             generator = PackageGenerator()
             generator.edit_package_image(
                 product_dir=product_dir,
-                instruction=instruction,
+                instruction=prompt,
             )
-
         except Exception as e:
             print(f"[PackageGenerator] generation error: {e}")
             raise RuntimeError(f"package generation failed: {e}") from e
-
-        # 5. 생성된 이미지 반환
+    
+        if not output_path.exists():
+            raise RuntimeError("package.png was not generated")
+    
         return output_path, f"{project_id}/package.png"
+
 
 
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
