@@ -13,6 +13,7 @@ import functools
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import requests
 from PIL import Image
@@ -361,6 +362,10 @@ async def generate_video_for_product(product_id: int, req: Any, product_image: U
 
     gclient = genai.Client(api_key=gemini_key)
     out_dir = _ensure_product_dir(product_id)
+    
+    # Ensure req is an object for dot notation access (supports both dict from worker and object from FastAPI)
+    if isinstance(req, dict):
+        req = SimpleNamespace(**req)
     
     # 1. Save Image (Supports UploadFile-like or raw bytes)
     if isinstance(product_image, bytes):
