@@ -16,7 +16,7 @@ from google.cloud import storage
 
 from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
-from services.video_generate import generate_video_for_product
+from services.video_2 import generate_video_for_product
 from services.package_generate import PackageGenerator
 
 load_dotenv()
