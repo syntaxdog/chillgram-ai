@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 
 
-class DielineAnalyzer:
+class DielineGenerator:
     def __init__(self):
         # 파라미터 초기화 (필요시 튜닝 가능하도록 클래스 변수로 관리)
         self.ADAPT_BLOCK = 31
