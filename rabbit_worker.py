@@ -17,6 +17,7 @@ from fastapi import UploadFile
 from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
 from services.video_generate import generate_video_for_product
+from services.package_generate import PackageGenerator
 
 load_dotenv()
 
@@ -220,6 +221,36 @@ class JobRunner:
             background_output_path=str(background_path) if payload.get("save_background", True) else None,
         )
         return final_path, f"{project_id}/sns.png"
+
+    def run_package(
+        project_id: int,
+        instruction: str = Form(...),
+        file: UploadFile = File(...),
+    ):
+        product_dir = ensure_product_dir(project_id)
+
+        input_path = product_dir / "package_input.png"
+        with input_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # 3. 결과 저장 경로
+        output_path = product_dir / "package.png"
+
+        # 4. Gemini 호출
+        try:
+            generator = PackageGenerator()
+            generator.edit_package_image(
+                product_dir=product_dir,
+                instruction=instruction,
+            )
+
+        except Exception as e:
+            print(f"Error generation package: {e}")
+            raise HTTPException(status_code=500, detail=f"package generation failed: {e}")
+
+        # 5. 생성된 이미지 반환
+        return output_path, f"{project_id}/package.png"
+
 
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
         """
