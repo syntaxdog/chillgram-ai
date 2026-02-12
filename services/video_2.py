@@ -19,16 +19,8 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# Try importing UploadFile from fastapi, fallback to Any if not installed (for local testing without fastapi)
-try:
-    from fastapi import UploadFile, HTTPException
-except ImportError:
-    from typing import Any as UploadFile
-    class HTTPException(Exception):
-        def __init__(self, status_code: int, detail: str):
-            super().__init__(detail)
-            self.status_code = status_code
-            self.detail = detail
+# FastAPI dependency removed for worker compatibility
+from typing import Any as UploadFile
 
 # =========================================================
 # Configuration & Constants
@@ -379,7 +371,7 @@ async def generate_video_for_product(product_id: int, req: Any, product_image: U
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     kie_key = os.environ.get("KIE_API_KEY", "")
     if not gemini_key or not kie_key:
-        raise HTTPException(status_code=500, detail="Missing API Keys")
+        raise ValueError("Missing API Keys")
 
     gclient = genai.Client(api_key=gemini_key)
     out_dir = _ensure_product_dir(product_id)
@@ -447,7 +439,7 @@ JSON Only.
         plan = await loop.run_in_executor(None, _plan_ad)
         scenes = _normalize_scenes_list(plan)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Planning failed: {e}")
+        raise RuntimeError(f"Planning failed: {e}")
 
     # 3. Execution Loop
     video_paths = []
@@ -479,7 +471,7 @@ JSON Only.
             img = Image.open(io.BytesIO(img_data))
             img.save(scene_img_path)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Image Gen Failed Scene {sid}: {e}")
+            raise RuntimeError(f"Image Gen Failed Scene {sid}: {e}")
 
         # B. Music (Scene 1 only) - Async
         if sid == 1:
