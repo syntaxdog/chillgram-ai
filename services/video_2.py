@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
-import aiohttp
+import requests
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -82,45 +82,40 @@ async def _extract_last_frame(video_path: str, out_path: str) -> str:
     return out_path
 
 async def upload_image_to_hosting(image_path: str | Path) -> str:
-    """이미지를 공개 URL로 업로드 (catbox -> file.io 순서) - Async"""
+    """이미지를 공개 URL로 업로드 (catbox -> file.io 순서) - Threaded Requests"""
     image_path = str(image_path)
     if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
         raise RuntimeError(f"이미지 파일 이상: {image_path}")
 
-    # Read file specifically for async upload
-    # Note: requests.post handles file opening, but aiohttp needs explicit open or BytesIO
-    # Since file is on disk, we can read it.
-    # Blocking I/O (File read) - OK for small files, or could use aiofiles
-    with open(image_path, "rb") as f:
-        file_content = f.read()
+    def _upload():
+        with open(image_path, "rb") as f:
+            file_content = f.read()
 
-    async with aiohttp.ClientSession() as session:
         # 1. catbox.moe
         try:
-            data = aiohttp.FormData()
-            data.add_field("reqtype", "fileupload")
-            data.add_field("fileToUpload", file_content, filename="image.png", content_type="image/png")
-            
-            async with session.post("https://catbox.moe/user/api.php", data=data, timeout=30) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    return text.strip()
+            files = {"fileToUpload": ("image.png", file_content, "image/png")}
+            data = {"reqtype": "fileupload"}
+            resp = requests.post("https://catbox.moe/user/api.php", data=data, files=files, timeout=30)
+            if resp.status_code == 200:
+                return resp.text.strip()
         except Exception:
             pass
 
         # 2. file.io
         try:
-            data = aiohttp.FormData()
-            data.add_field("file", file_content, filename="image.png", content_type="image/png")
-            
-            async with session.post("https://file.io/?expires=1d", data=data, timeout=30) as resp:
-                if resp.status == 200:
-                    rj = await resp.json()
-                    if rj.get("success"):
-                        return rj.get("link")
+            files = {"file": ("image.png", file_content, "image/png")}
+            resp = requests.post("https://file.io/?expires=1d", files=files, timeout=30)
+            if resp.status_code == 200:
+                rj = resp.json()
+                if rj.get("success"):
+                    return rj.get("link")
         except Exception:
             pass
-            
+        return None
+
+    url = await asyncio.to_thread(_upload)
+    if url:
+        return url
     raise RuntimeError("모든 이미지 호스팅 서비스 업로드 실패")
 
 # =========================================================
@@ -160,7 +155,7 @@ async def analyze_image_for_music(gclient, types, img_path: str) -> str:
     return await loop.run_in_executor(None, _blocking_gemini)
 
 async def generate_suno_music(kie_key: str, prompt: str) -> Optional[str]:
-    """KIE Suno API를 사용하여 음악 생성 - Async"""
+    """KIE Suno API를 사용하여 음악 생성 - Threaded Requests"""
     headers = {"Authorization": f"Bearer {kie_key}", "Content-Type": "application/json"}
     payload = {
         "model": "ai-music-api/generate",
@@ -175,38 +170,40 @@ async def generate_suno_music(kie_key: str, prompt: str) -> Optional[str]:
         }
     }
 
-    async with aiohttp.ClientSession() as session:
+    def _generate():
         try:
-            async with session.post("https://api.kie.ai/api/v1/jobs/createTask", headers=headers, json=payload, timeout=60) as resp:
-                if resp.status != 200: return None
-                task_data = await resp.json()
-                if task_data.get("code") != 200: return None
-                task_id = task_data["data"]["id"]
+            resp = requests.post("https://api.kie.ai/api/v1/jobs/createTask", headers=headers, json=payload, timeout=60)
+            if resp.status_code != 200: return None
+            task_data = resp.json()
+            if task_data.get("code") != 200: return None
+            task_id = task_data["data"]["id"]
             
-            # Polling (Async)
+            # Polling
             for _ in range(60):
-                await asyncio.sleep(2)
-                async with session.get(f"https://api.kie.ai/api/v1/jobs/getTask?id={task_id}", headers=headers) as stat_resp:
-                    if stat_resp.status == 200:
-                        stat_data = await stat_resp.json()
-                        status = stat_data["data"]["status"]
-                        
-                        if status == "SUCCEEDED":
-                            res = stat_data["data"]["response"]
-                            try:
-                                if isinstance(res, dict):
-                                    if "audio_urls" in res and res["audio_urls"]: return res["audio_urls"][0]
-                                    if "audio_clips" in res and res["audio_clips"]:
-                                        return res["audio_clips"][0].get("audio_url") or res["audio_clips"][0].get("video_url")
-                                if isinstance(res, list) and len(res) > 0:
-                                     if isinstance(res[0], str) and res[0].startswith("http"): return res[0]
-                            except Exception:
-                                pass
-                            return None
-                        if status == "FAILED": return None
+                time.sleep(2)
+                stat_resp = requests.get(f"https://api.kie.ai/api/v1/jobs/getTask?id={task_id}", headers=headers, timeout=30)
+                if stat_resp.status_code == 200:
+                    stat_data = stat_resp.json()
+                    status = stat_data["data"]["status"]
+                    
+                    if status == "SUCCEEDED":
+                        res = stat_data["data"]["response"]
+                        try:
+                            if isinstance(res, dict):
+                                if "audio_urls" in res and res["audio_urls"]: return res["audio_urls"][0]
+                                if "audio_clips" in res and res["audio_clips"]:
+                                    return res["audio_clips"][0].get("audio_url") or res["audio_clips"][0].get("video_url")
+                            if isinstance(res, list) and len(res) > 0:
+                                 if isinstance(res[0], str) and res[0].startswith("http"): return res[0]
+                        except Exception:
+                            pass
+                        return None
+                    if status == "FAILED": return None
         except Exception:
             return None
-    return None
+        return None
+
+    return await asyncio.to_thread(_generate)
 
 # =========================================================
 # Core Logic
@@ -224,15 +221,8 @@ def _normalize_scenes_list(plan: Any) -> List[Dict[str, Any]]:
     if isinstance(plan, list): return plan
     raise ValueError("Invalid plan structure")
 
-async def _generate_video_clip_sora2(kie_key: str, img_path: Path, prompt: str, duration: int = 15) -> str:
-    """Sora 2 Generating using URL upload - Async"""
-    
-    # 1. Upload to Hosting
-    image_url = await upload_image_to_hosting(img_path)
-    if image_url.startswith("http://"): image_url = image_url.replace("http://", "https://")
-    
-    # Wait for propagation
-    await asyncio.sleep(6)
+async def _generate_video_clip_sora2(kie_key: str, image_url: str, prompt: str, duration: int = 15) -> str:
+    """Sora 2 Generating - Threaded Requests"""
     
     # 2. Prompt Sanitization & Enhancement
     clean_prompt = "".join([c for c in prompt if ord(c) < 128])
@@ -251,63 +241,59 @@ async def _generate_video_clip_sora2(kie_key: str, img_path: Path, prompt: str, 
         }
     }
 
-    async with aiohttp.ClientSession() as session:
+    def _generate():
         # Retry Loop
         for _ in range(3):
             task_id = None
             # Create Task
             for _ in range(3):
                 try:
-                    async with session.post("https://api.kie.ai/api/v1/jobs/createTask", headers=headers, json=payload, timeout=60) as resp:
-                        resp_text = await resp.text()
-                        if resp.status == 429 or "heavy load" in resp_text.lower():
-                            await asyncio.sleep(60); continue
-                        
-                        data = json.loads(resp_text)
-                        if data.get("code") != 200:
-                            if "heavy load" in str(data).lower(): await asyncio.sleep(60); continue
-                            await asyncio.sleep(10); continue
-                        
-                        task_id = data.get("data", {}).get("taskId")
-                        if task_id: break
+                    resp = requests.post("https://api.kie.ai/api/v1/jobs/createTask", headers=headers, json=payload, timeout=60)
+                    resp_text = resp.text
+                    if resp.status_code == 429 or "heavy load" in resp_text.lower():
+                        time.sleep(60); continue
+                    
+                    data = json.loads(resp_text)
+                    if data.get("code") != 200:
+                        if "heavy load" in str(data).lower(): time.sleep(60); continue
+                        time.sleep(10); continue
+                    
+                    task_id = data.get("data", {}).get("taskId")
+                    if task_id: break
                 except Exception:
-                    await asyncio.sleep(10)
+                    time.sleep(10)
             
             if not task_id: continue
 
             # Poll Task
-            success_url = None
-            poll_failed = False
             poll_url = f"https://api.kie.ai/api/v1/jobs/recordInfo?taskId={task_id}"
-            
             for _ in range(120): # 10 min
-                await asyncio.sleep(5)
+                time.sleep(5)
                 try:
-                    async with session.get(poll_url, headers=headers, timeout=30) as p_resp:
-                        if p_resp.status != 200: continue
-                        p_data = await p_resp.json()
-                        
-                        state = p_data.get("data", {}).get("state")
-                        if state == "success":
-                            res_json = json.loads(p_data["data"].get("resultJson", "{}"))
-                            url_list = res_json.get("resultUrls", [])
-                            if url_list:
-                                success_url = url_list[0]
-                                break
-                        elif state == "fail":
-                            fail_msg = p_data["data"].get("failMsg", "unknown")
-                            if "heavy load" in fail_msg.lower():
-                                await asyncio.sleep(60); poll_failed = True; break
-                            if "safety" in fail_msg.lower(): raise RuntimeError(f"Safety: {fail_msg}")
-                            poll_failed = True; break
+                    p_resp = requests.get(poll_url, headers=headers, timeout=30)
+                    if p_resp.status_code != 200: continue
+                    p_data = p_resp.json()
+                    
+                    state = p_data.get("data", {}).get("state")
+                    if state == "success":
+                        res_json = json.loads(p_data["data"].get("resultJson", "{}"))
+                        url_list = res_json.get("resultUrls", [])
+                        if url_list:
+                            return url_list[0]
+                    elif state == "fail":
+                        fail_msg = p_data["data"].get("failMsg", "unknown")
+                        if "heavy load" in fail_msg.lower():
+                            time.sleep(60); break
+                        if "safety" in fail_msg.lower(): raise RuntimeError(f"Safety: {fail_msg}")
+                        break
                 except Exception as e:
                     if "Safety" in str(e): raise e
                     continue
-            
-            if success_url:
-                return success_url 
-            if poll_failed: continue
+        return None
 
+    res_url = await asyncio.to_thread(_generate)
+    if res_url:
+        return res_url
     raise RuntimeError("Sora 2 Video Generation Failed")
 
 async def _concat_and_mix(video_paths: List[str], bgm_path: Optional[str], out_path: str, fade: float = 0.5):
@@ -480,27 +466,36 @@ JSON Only.
                 bgm_url = await generate_suno_music(kie_key, music_prompt)
                 if bgm_url:
                     bgm_path = out_dir / "bgm.mp3"
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(bgm_url) as resp:
-                            if resp.status == 200:
-                                with open(bgm_path, "wb") as f: f.write(await resp.read())
+                    def _download_bgm():
+                        r = requests.get(bgm_url, timeout=60)
+                        if r.status_code == 200:
+                            with open(bgm_path, "wb") as f: f.write(r.content)
+                    await asyncio.to_thread(_download_bgm)
             except Exception:
                 pass 
 
-        # C. Video Generation (Sora 2) - Async
+        # C. Video Generation (Sora 2) - Async (with internal threaded requests)
+        # 1. Upload to Hosting
+        image_url = await upload_image_to_hosting(scene_img_path)
+        if image_url.startswith("http://"): image_url = image_url.replace("http://", "https://")
+        
+        # Wait for propagation
+        await asyncio.sleep(6)
+
         vid_url = await _generate_video_clip_sora2(
             kie_key=kie_key,
-            img_path=scene_img_path,
+            image_url=image_url,
             prompt=sc["video_prompt"],
             duration=10
         )
         
-        # Download Video - Async
+        # Download Video
         vid_path = out_dir / f"scene_{sid}.mp4"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(vid_url) as resp:
-                if resp.status == 200:
-                    with open(vid_path, "wb") as f: f.write(await resp.read())
+        def _download_vid():
+            r = requests.get(vid_url, timeout=120)
+            if r.status_code == 200:
+                with open(vid_path, "wb") as f: f.write(r.content)
+        await asyncio.to_thread(_download_vid)
                     
         video_paths.append(str(vid_path))
         

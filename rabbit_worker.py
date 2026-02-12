@@ -30,15 +30,6 @@ class BytesFile:
     async def read(self) -> bytes:
         return self._data
 
-class BytesFile:
-    """FastAPI UploadFile adapter for local files (Async compatible)."""
-    def __init__(self, filename: str, data: bytes):
-        self.filename = filename
-        self._data = data
-
-    async def read(self) -> bytes:
-        return self._data
-
 
 # =========================
 # Env
