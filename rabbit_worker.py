@@ -225,13 +225,10 @@ class JobRunner:
     def run_package(
         project_id: int,
         instruction: str = Form(...),
-        file: UploadFile = File(...),
     ):
         product_dir = ensure_product_dir(project_id)
 
         input_path = product_dir / "package_input.png"
-        with input_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
 
         # 3. 결과 저장 경로
         output_path = product_dir / "package.png"
