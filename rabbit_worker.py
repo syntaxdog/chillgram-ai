@@ -432,7 +432,7 @@ async def main():
 
     connection = await aio_pika.connect_robust(env.rabbitmq_url)
     channel = await connection.channel()
-    await channel.set_qos(prefetch_count=1)
+    await channel.set_qos(prefetch_count=10)
 
     await channel.declare_queue(env.queue_jobs, durable=True)
     await channel.declare_queue(env.queue_results, durable=True)
