@@ -301,14 +301,7 @@ class JobRunner:
         
         return output_path, f"{project_id}/dieline_result.png"
 
-class BytesFile:
-    """FastAPI UploadFile adapter for local files (Async compatible)."""
-    def __init__(self, filename: str, data: bytes):
-        self.filename = filename
-        self._data = data
 
-    async def read(self) -> bytes:
-        return self._data
 
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
         """
