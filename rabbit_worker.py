@@ -4,12 +4,15 @@ import os
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 import aio_pika
 from aio_pika import DeliveryMode, Message, IncomingMessage
 from dotenv import load_dotenv
 from google.cloud import storage
+
+# FastAPI UploadFile 래핑용 (worker 이미지에 fastapi가 있어야 함)
+from fastapi import UploadFile
 
 from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
@@ -18,6 +21,7 @@ from services.video_generate import generate_video_for_product
 load_dotenv()
 
 
+# Env
 @dataclass(frozen=True)
 class Env:
     api_key: str
@@ -25,6 +29,7 @@ class Env:
     queue_jobs: str
     queue_results: str
     gcs_bucket: str
+    video_timeout_sec: int
 
 
 def load_env() -> Env:
@@ -34,6 +39,7 @@ def load_env() -> Env:
         queue_jobs=os.getenv("RABBITMQ_QUEUE", ""),
         queue_results=os.getenv("RABBITMQ_RESULT_QUEUE", "chillgram.job-results"),
         gcs_bucket=os.getenv("GCS_BUCKET", ""),
+        video_timeout_sec=int(os.getenv("VIDEO_TIMEOUT_SEC", "900")),  # 기본 15분
     )
 
 
@@ -57,13 +63,12 @@ def pick(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 def parse_job_message(raw: str) -> Dict[str, Any]:
     """
     Supports:
-    - Plain job JSON (most likely with Debezium outbox router)
+    - Plain job JSON
     - Debezium envelope:
       {"schema":{...},"payload":"{...job json...}"}
     """
     outer = json.loads(raw)
 
-    # Debezium envelope
     if isinstance(outer, dict) and "schema" in outer and "payload" in outer:
         inner = outer["payload"]
         if isinstance(inner, str):
@@ -78,17 +83,19 @@ def parse_job_message(raw: str) -> Dict[str, Any]:
     return outer
 
 
+# Payload normalize (API(main.py) 스키마 맞추기)
 def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    job_type = job_type.upper()
+    jt = job_type.upper()
 
-    if job_type == "BANNER":
+    if jt == "BANNER":
         headline = pick(payload, "headline")
         typo_text = pick(payload, "typo_text", "typoText")
         if not headline or not typo_text:
             raise ValueError(f"BANNER payload missing: headline={headline}, typoText={typo_text}")
         return {"headline": headline, "typo_text": typo_text}
 
-    if job_type == "SNS":
+    if jt == "SNS":
+        # main.py SNSGenRequest와 호환
         main_text = pick(payload, "main_text", "mainText")
         sub_text = pick(payload, "sub_text", "subText", default="")
         preset = pick(payload, "preset")
@@ -108,12 +115,43 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "save_background": bool(save_background),
         }
 
-    if job_type == "VIDEO":
-        return payload
+    if jt == "VIDEO":
+        # main.py VideoGenRequest와 호환 (필수 4개)
+        # 기존에 네가 prompt/durationSec 같은 걸 보내면 여기서 걸러서 명확히 실패시킴.
+        food_name = pick(payload, "food_name", "foodName")
+        food_type = pick(payload, "food_type", "foodType")
+        ad_concept = pick(payload, "ad_concept", "adConcept")
+        ad_req = pick(payload, "ad_req", "adReq")
+
+        if not (food_name and food_type and ad_concept and ad_req):
+            raise ValueError(
+                "VIDEO payload must match VideoGenRequest: "
+                "{food_name/foodName, food_type/foodType, ad_concept/adConcept, ad_req/adReq}"
+            )
+
+        return {
+            "food_name": food_name,
+            "food_type": food_type,
+            "ad_concept": ad_concept,
+            "ad_req": ad_req,
+        }
+
+    if jt == "PACKAGE":
+        # worker에서 package 생성까지 하고 싶다면 payload 정의 필요
+        # 최소: dieline_path / concept_path 로컬 경로, 또는 GCS URI 다운로드 로직을 추가해야 함.
+        # 여기서는 로컬 파일 경로를 받는 최소 형태로만 구현.
+        dieline_local = pick(payload, "dieline_path", "dielinePath")
+        concept_local = pick(payload, "concept_path", "conceptPath")
+        instruction = pick(payload, "instruction", default="")
+
+        if not dieline_local or not concept_local:
+            raise ValueError("PACKAGE payload missing: dieline_path/dielinePath and concept_path/conceptPath")
+        return {"dieline_path": dieline_local, "concept_path": concept_local, "instruction": instruction}
 
     return payload
 
 
+# GCS upload
 class GcsUploader:
     def __init__(self, bucket: str):
         if not bucket:
@@ -128,10 +166,12 @@ class GcsUploader:
         return f"gs://{self.bucket_name}/{object_name}"
 
 
+# Runner
 class JobRunner:
-    def __init__(self, api_key: str, uploader: GcsUploader):
+    def __init__(self, api_key: str, uploader: GcsUploader, video_timeout_sec: int):
         self.api_key = api_key
         self.uploader = uploader
+        self.video_timeout_sec = video_timeout_sec
 
     def run_banner(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
         d = ensure_project_dir(project_id)
@@ -174,8 +214,80 @@ class JobRunner:
         return final_path, f"{project_id}/sns.png"
 
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
-        out = await generate_video_for_product(project_id=project_id, req=payload, product_image=None)
-        return Path(out), f"{project_id}/video.mp4"
+        """
+        main.py의 /ai/{project_id}/video 처럼:
+        - req: VideoGenRequest (dict로 전달 가능)
+        - file: UploadFile (이미지)
+        worker는 업로드가 없으니 ai/{project_id}/package.png를 UploadFile로 래핑해서 넘긴다.
+        """
+        d = ensure_project_dir(project_id)
+        package_path = d / "package.png"
+        if not package_path.exists():
+            raise FileNotFoundError("package.png not found. VIDEO requires package.png in ai/{projectId}/")
+
+        f = package_path.open("rb")
+        try:
+            upload = UploadFile(filename="package.png", file=f)
+            # generate_video_for_product가 내부에서 content_type을 검사한다면 아래 줄 추가 가능:
+            # upload.content_type = "image/png"  # fastapi UploadFile은 속성 세터가 애매할 수 있음
+
+            # 무한 대기 방지 (필수)
+            out = await asyncio.wait_for(
+                generate_video_for_product(project_id=project_id, req=payload, product_image=upload),
+                timeout=self.video_timeout_sec,
+            )
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+        out_path = Path(out)
+        return out_path, f"{project_id}/video.mp4"
+
+    def run_package(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
+        """
+        main.py create_package_with_gemini의 핵심만 worker로 옮긴 최소 구현.
+        payload에서 로컬 파일 경로로 dieline/concept을 받아 ai/{project_id}/에 복사 후 파이프라인 실행.
+        """
+        d = ensure_project_dir(project_id)
+        dieline_src = Path(payload["dieline_path"])
+        concept_src = Path(payload["concept_path"])
+        instruction = payload.get("instruction", "") or ""
+
+        if not dieline_src.exists():
+            raise FileNotFoundError(f"dieline_path not found: {dieline_src}")
+        if not concept_src.exists():
+            raise FileNotFoundError(f"concept_path not found: {concept_src}")
+
+        dieline_path = d / "dieline_input.png"
+        concept_path = d / "concept_input.png"
+        dieline_path.write_bytes(dieline_src.read_bytes())
+        concept_path.write_bytes(concept_src.read_bytes())
+
+        generated_temp_path = Path("FINAL_RESULT4.png")
+        final_output_path = d / "package.png"
+
+        # GeminiPlease 파이프라인 실행
+        import GeminiPlease
+        GeminiPlease.run_final_natural_pipeline(str(dieline_path.resolve()), str(concept_path.resolve()))
+
+        if generated_temp_path.exists():
+            # 결과 이동
+            final_output_path.write_bytes(generated_temp_path.read_bytes())
+            try:
+                generated_temp_path.unlink()
+            except Exception:
+                pass
+        else:
+            raise FileNotFoundError("Generation script finished but no output found (FINAL_RESULT4.png).")
+
+        # (옵션) instruction edit는 네 main.py가 package_generate를 부르지만
+        # worker 이미지에 그 모듈이 없을 수 있어 여기서는 생략/확장 포인트로 둔다.
+        # 필요하면 PackageGenerator 적용 로직을 그대로 이쪽에 추가하면 됨.
+        _ = instruction  # unused
+
+        return final_output_path, f"{project_id}/package.png"
 
     async def execute(self, job: Dict[str, Any]) -> str:
         job_type = str(job.get("jobType", "")).upper()
@@ -192,12 +304,15 @@ class JobRunner:
             local_path, obj = self.run_sns(project_id, payload_norm)
         elif job_type == "VIDEO":
             local_path, obj = await self.run_video(project_id, payload_norm)
+        elif job_type == "PACKAGE":
+            local_path, obj = self.run_package(project_id, payload_norm)
         else:
             raise ValueError(f"unsupported jobType: {job_type}")
 
         return self.uploader.upload(local_path, obj)
 
 
+# Result publisher
 class ResultPublisher:
     def __init__(self, channel: aio_pika.Channel, result_queue: str):
         self.channel = channel
@@ -213,6 +328,7 @@ class ResultPublisher:
         await self.channel.default_exchange.publish(msg, routing_key=self.result_queue)
 
 
+# Consumer
 async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPublisher):
     raw = msg.body.decode("utf-8", errors="replace")
     print(f"[RECEIVED] {raw}", flush=True)
@@ -226,10 +342,12 @@ async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPub
             if not job_id:
                 raise ValueError("jobId is empty")
 
-            # 실행
+            jt = str(job.get("jobType", "")).upper()
+            pid = job.get("projectId")
+            print(f"[JOB START] jobId={job_id} type={jt} projectId={pid}", flush=True)
+
             gs_uri = await runner.execute(job)
 
-            # 성공 결과
             await pub.publish({
                 "jobId": job_id,
                 "success": True,
@@ -244,7 +362,6 @@ async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPub
             print("[JOB ERROR] job failed", flush=True)
             traceback.print_exc()
 
-            # 실패 결과(best effort)
             try:
                 await pub.publish({
                     "jobId": job_id,
@@ -274,12 +391,11 @@ async def main():
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)
 
-    # queues
     await channel.declare_queue(env.queue_jobs, durable=True)
     await channel.declare_queue(env.queue_results, durable=True)
 
     uploader = GcsUploader(env.gcs_bucket)
-    runner = JobRunner(env.api_key, uploader)
+    runner = JobRunner(env.api_key, uploader, video_timeout_sec=env.video_timeout_sec)
     publisher = ResultPublisher(channel, env.queue_results)
 
     q = await channel.get_queue(env.queue_jobs)
