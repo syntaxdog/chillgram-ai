@@ -18,6 +18,8 @@ from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
 from services.video_2 import generate_video_for_product
 from services.package_generate import PackageGenerator
+from services.dieline_generate import DielineGenerator
+
 
 load_dotenv()
 
@@ -107,6 +109,15 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not headline or not typo_text:
             raise ValueError(f"BANNER payload missing: headline={headline}, typoText={typo_text}")
         return {"headline": headline, "typo_text": typo_text}
+
+    if jt == "DIELINE":
+        prompt = pick(payload, "prompt", "instruction", default="")
+        # 컨셉 이미지 파일명이 따로 들어온다면 받고, 없으면 기본값 설정
+        concept_file = pick(payload, "concept_file", "conceptFile", default="concept_input.jpg")
+        return {
+            "prompt": prompt,
+            "concept_file": concept_file
+        }
 
     if jt == "SNS":
         # main.py SNSGenRequest와 호환
@@ -262,6 +273,43 @@ class JobRunner:
     
         return output_path, f"{project_id}/package.png"
 
+
+    def run_dieline(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
+        d = ensure_project_dir(project_id)
+        
+        dieline_input = d / "dieline_input.png"
+        concept_input = d / payload.get("concept_file", "concept_input.jpg")
+        
+        output_path = d / "dieline_result.png"
+
+        # 파일 존재 여부 체크
+        if not dieline_input.exists():
+            raise FileNotFoundError(f"Missing: {dieline_input}")
+        if not concept_input.exists():
+            raise FileNotFoundError(f"Missing: {concept_input}")
+
+        # 서비스 호출
+        from services.dieline_generate import DielineGenerator
+        gen = DielineGenerator(api_key=self.api_key)
+        
+        # 제공된 스크립트 로직 실행
+        gen.generate(
+            dieline_path=str(dieline_input),
+            concept_path=str(concept_input),
+            output_path=str(output_path)
+        )
+        
+        return output_path, f"{project_id}/dieline_result.png"
+
+class BytesFile:
+    """FastAPI UploadFile adapter for local files (Async compatible)."""
+    def __init__(self, filename: str, data: bytes):
+        self.filename = filename
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
         """
         main.py의 /ai/{project_id}/video 처럼:
@@ -307,6 +355,8 @@ class JobRunner:
             local_path, obj = await self.run_video(project_id, payload_norm)
         elif job_type == "PACKAGE":
             local_path, obj = self.run_package(project_id, payload_norm)
+        elif job_type == "DIELINE":
+            local_path, obj = self.run_dieline(project_id, payload_norm)
         else:
             raise ValueError(f"unsupported jobType: {job_type}")
 

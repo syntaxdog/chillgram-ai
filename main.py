@@ -8,7 +8,7 @@ from typing import Optional
 import os
 
 # 전개도 생성 모듈
-from services.dieline_generate import DielineAnalyzer
+from services.dieline_generate import DielineGenerator
 
 # 배너 생성 모듈
 from services.banner_generate import AdBannerGenerator
@@ -180,7 +180,7 @@ def analyze_dieline(project_id: int, file: UploadFile = File(...)):
     with input_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    analyzer = DielineAnalyzer()
+    analyzer = DielineGenerator()
     try:
         result = analyzer.analyze(image_path=str(input_path), output_dir=product_dir)
         result["result_image_url"] = f"/ai/{project_id}/images/dieline"
