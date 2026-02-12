@@ -13,12 +13,31 @@ from google.cloud import storage
 
 
 
+
 from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
 from services.video_generate import generate_video_for_product
 from services.package_generate import PackageGenerator
 
 load_dotenv()
+
+class BytesFile:
+    """FastAPI UploadFile adapter for local files (Async compatible)."""
+    def __init__(self, filename: str, data: bytes):
+        self.filename = filename
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+class BytesFile:
+    """FastAPI UploadFile adapter for local files (Async compatible)."""
+    def __init__(self, filename: str, data: bytes):
+        self.filename = filename
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
 
 
 # =========================
@@ -252,16 +271,6 @@ class JobRunner:
     
         return output_path, f"{project_id}/package.png"
 
-
-class BytesFile:
-    """FastAPI UploadFile adapter for local files (Async compatible)."""
-    def __init__(self, filename: str, data: bytes):
-        self.filename = filename
-        self._data = data
-
-    async def read(self) -> bytes:
-        return self._data
-
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str]:
         """
         main.py의 /ai/{project_id}/video 처럼:
@@ -311,6 +320,13 @@ class BytesFile:
             raise ValueError(f"unsupported jobType: {job_type}")
 
         return self.uploader.upload(local_path, obj)
+
+
+
+
+
+
+
 
 
 # =========================
