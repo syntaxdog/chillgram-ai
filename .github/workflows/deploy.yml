@@ -44,22 +44,24 @@ jobs:
               cd CHILLGRAM_AI
           
               echo "📝 Creating .env file..."
-              cat > .env.tmp <<'"'"'ENVEOF'"'"'
-              ${{ secrets.ENV_FILE }}
-              ENVEOF
-              sudo mv .env.tmp .env
+              echo "${{ secrets.ENV_FILE }}" | sudo tee .env > /dev/null
               sudo chmod 644 .env
           
               echo "🔑 Creating GCS credentials..."
               sudo mkdir -p /opt/chillgram/secrets
               sudo chmod 755 /opt/chillgram/secrets
               
-              cat > /tmp/gcs.json.tmp <<'"'"'GCSEOF'"'"'
-              ${{ secrets.GCP_WORKER_SA_KEY_JSON }}
-              GCSEOF
-              sudo mv /tmp/gcs.json.tmp /opt/chillgram/secrets/gcs.json
+              # 기존 파일 삭제 (옛날 소유자 정보 제거)
+              sudo rm -f /opt/chillgram/secrets/gcs.json
+              
+              # GCS credentials를 안전하게 생성
+              echo "${{ secrets.GCP_WORKER_SA_KEY_JSON }}" | sudo tee /opt/chillgram/secrets/gcs.json > /dev/null
               sudo chown 1005:1006 /opt/chillgram/secrets/gcs.json
               sudo chmod 400 /opt/chillgram/secrets/gcs.json
+              
+              # 권한 확인 (디버깅용)
+              echo "🔍 Checking file permissions..."
+              sudo ls -la /opt/chillgram/secrets/gcs.json
               
               # JSON 파일이 유효한지 검증
               if ! sudo -u "#1005" python3 -m json.tool /opt/chillgram/secrets/gcs.json > /dev/null 2>&1; then
