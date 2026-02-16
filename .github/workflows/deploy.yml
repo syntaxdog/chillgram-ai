@@ -51,23 +51,23 @@ jobs:
               sudo mkdir -p /opt/chillgram/secrets
               sudo chmod 755 /opt/chillgram/secrets
               
-              # 기존 파일 삭제 (권한 꼬임 방지)
+              # 기존 파일 삭제
               sudo rm -f /opt/chillgram/secrets/gcs.json
 
               # 새 파일 생성
               echo "${{ secrets.GCP_WORKER_SA_KEY_JSON }}" | sudo tee /opt/chillgram/secrets/gcs.json > /dev/null
               
-              # 소유권 변경
-              sudo chown 1005:1006 /opt/chillgram/secrets/gcs.json
-              sudo chmod 400 /opt/chillgram/secrets/gcs.json
+              # 모든 사용자가 읽을 수 있도록 설정 (chown이 불안정한 환경 대응)
+              sudo chmod 644 /opt/chillgram/secrets/gcs.json
               
               # 권한 확인 (디버깅용)
               echo "🔍 Checking file permissions..."
               sudo ls -la /opt/chillgram/secrets/gcs.json
               
-              # JSON 파일 문법 검증 (호스트에서는 sudo로만 실행)
+              # JSON 파일 문법 검증
               if ! sudo python3 -m json.tool /opt/chillgram/secrets/gcs.json > /dev/null 2>&1; then
                 echo "❌ Invalid GCS credentials JSON"
+                sudo cat /opt/chillgram/secrets/gcs.json | head -3
                 exit 1
               fi
               echo "✅ GCS credentials validated"
