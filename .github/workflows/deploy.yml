@@ -47,17 +47,18 @@ jobs:
               echo "${{ secrets.ENV_FILE }}" | sudo tee .env > /dev/null
               sudo chmod 644 .env
           
-              echo "🔑 Creating GCS credentials..."
+              echo "🔑 Setting up GCS credentials..."
               sudo mkdir -p /opt/chillgram/secrets
               sudo chmod 755 /opt/chillgram/secrets
               
-              # 기존 파일 삭제
+              # 기존 파일 삭제 (충돌 방지)
               sudo rm -f /opt/chillgram/secrets/gcs.json
 
-              # 새 파일 생성
-              echo "${{ secrets.GCP_WORKER_SA_KEY_JSON }}" | sudo tee /opt/chillgram/secrets/gcs.json > /dev/null
+              # 시크릿에 저장된 경로에서 파일 복사
+              echo "Copying key from: ${{ secrets.GCP_WORKER_SA_KEY_JSON }}"
+              sudo cp "${{ secrets.GCP_WORKER_SA_KEY_JSON }}" /opt/chillgram/secrets/gcs.json
               
-              # 모든 사용자가 읽을 수 있도록 설정 (chown이 불안정한 환경 대응)
+              # 모든 사용자가 읽을 수 있도록 설정 (권한 에러 원천 차단)
               sudo chmod 644 /opt/chillgram/secrets/gcs.json
               
               # 권한 확인 (디버깅용)
@@ -66,8 +67,8 @@ jobs:
               
               # JSON 파일 문법 검증
               if ! sudo python3 -m json.tool /opt/chillgram/secrets/gcs.json > /dev/null 2>&1; then
-                echo "❌ Invalid GCS credentials JSON"
-                sudo cat /opt/chillgram/secrets/gcs.json | head -3
+                echo "❌ Invalid GCS credentials JSON (Copy failed or invalid file)"
+                sudo head -n 3 /opt/chillgram/secrets/gcs.json
                 exit 1
               fi
               echo "✅ GCS credentials validated"
