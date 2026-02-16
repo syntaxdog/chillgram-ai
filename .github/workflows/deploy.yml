@@ -47,30 +47,24 @@ jobs:
               echo "${{ secrets.ENV_FILE }}" | sudo tee .env > /dev/null
               sudo chmod 644 .env
           
-              echo "🔑 Setting up GCS credentials..."
-              sudo mkdir -p /opt/chillgram/secrets
-              sudo chmod 755 /opt/chillgram/secrets
+              echo "🔑 Checking GCS credentials..."
               
-              # 기존 파일 삭제
-              sudo rm -rf /opt/chillgram/secrets/gcs.json
-
-              # JSON 내용을 파일로 저장
-              echo "${{ secrets.GCP_WORKER_SA_KEY_JSON }}" | sudo tee /opt/chillgram/secrets/gcs.json > /dev/null
-              
-              # 권한 설정 (모든 사용자 읽기 가능)
-              sudo chmod 644 /opt/chillgram/secrets/gcs.json
+              # 파일 존재 확인
+              if [ ! -f /opt/chillgram/secrets/gcs.json ]; then
+                echo "❌ GCS credentials file not found"
+                exit 1
+              fi
               
               # 권한 확인
-              echo "🔍 Checking file permissions..."
+              echo "🔍 File permissions:"
               sudo ls -la /opt/chillgram/secrets/gcs.json
               
               # JSON 문법 검증
               if ! sudo python3 -m json.tool /opt/chillgram/secrets/gcs.json > /dev/null 2>&1; then
                 echo "❌ Invalid GCS credentials JSON"
-                sudo head -n 3 /opt/chillgram/secrets/gcs.json
                 exit 1
               fi
-              echo "✅ GCS credentials validated"
+              echo "✅ GCS credentials OK"
           
               echo "🔧 Fixing permissions for ./ai volume..."
               sudo mkdir -p ai/tmp/basic
