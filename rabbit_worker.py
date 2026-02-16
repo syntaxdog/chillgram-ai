@@ -14,7 +14,6 @@ from google.cloud import storage
 from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
 from services.video_2 import generate_video_for_product
-from services.package_generate import PackageGenerator
 from services.dieline_generate import DielineGenerator
 
 load_dotenv()
@@ -30,37 +29,44 @@ class Env:
     queue_results: str
     gcs_bucket: str
     video_timeout_sec: int
-    gcs_public_base_url: str   # ✅ public url base (예: https://storage.googleapis.com/<bucket>)
+    gcs_public_base_url: str  # 예: https://storage.googleapis.com/<bucket>
+
 
 def load_env() -> Env:
-    bucket = os.getenv("GCS_BUCKET", "")
-    # 기본 public base: https://storage.googleapis.com/<bucket>
-    public_base = os.getenv("GCS_PUBLIC_BASE_URL", f"https://storage.googleapis.com/{bucket}" if bucket else "")
+    bucket = os.getenv("GCS_BUCKET", "").strip()
+    public_base = os.getenv("GCS_PUBLIC_BASE_URL", "").strip()
+    if not public_base and bucket:
+        public_base = f"https://storage.googleapis.com/{bucket}"
     return Env(
-        api_key=os.getenv("GEMINI_API_KEY", ""),
-        rabbitmq_url=os.getenv("RABBITMQ_URL", ""),
-        queue_jobs=os.getenv("RABBITMQ_QUEUE", ""),
-        queue_results=os.getenv("RABBITMQ_RESULT_QUEUE", "chillgram.job-results"),
+        api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+        rabbitmq_url=os.getenv("RABBITMQ_URL", "").strip(),
+        queue_jobs=os.getenv("RABBITMQ_QUEUE", "").strip(),
+        queue_results=os.getenv("RABBITMQ_RESULT_QUEUE", "chillgram.job-results").strip(),
         gcs_bucket=bucket,
-        video_timeout_sec=int(os.getenv("VIDEO_TIMEOUT_SEC", "900")),  # 기본 15분
+        video_timeout_sec=int(os.getenv("VIDEO_TIMEOUT_SEC", "900")),
         gcs_public_base_url=public_base,
     )
 
+
 BASE_DIR = Path(__file__).resolve().parent
 AI_DIR = BASE_DIR / "ai"
+
 
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+
 def ensure_project_dir(project_id: int) -> Path:
     return ensure_dir(AI_DIR / str(project_id))
+
 
 def pick(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         if k in d and d[k] is not None:
             return d[k]
     return default
+
 
 def parse_job_message(raw: str) -> Dict[str, Any]:
     """
@@ -71,6 +77,7 @@ def parse_job_message(raw: str) -> Dict[str, Any]:
     """
     outer = json.loads(raw)
 
+    # Debezium envelope
     if isinstance(outer, dict) and "schema" in outer and "payload" in outer:
         inner = outer["payload"]
         if isinstance(inner, str):
@@ -84,6 +91,7 @@ def parse_job_message(raw: str) -> Dict[str, Any]:
 
     return outer
 
+
 # =========================
 # Payload normalize
 # =========================
@@ -96,11 +104,6 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not headline or not typo_text:
             raise ValueError(f"BANNER payload missing: headline={headline}, typoText={typo_text}")
         return {"headline": headline, "typo_text": typo_text}
-
-    if jt == "DIELINE":
-        prompt = pick(payload, "prompt", "instruction", default="")
-        concept_file = pick(payload, "concept_file", "conceptFile", default="concept_input.jpg")
-        return {"prompt": prompt, "concept_file": concept_file}
 
     if jt == "SNS":
         main_text = pick(payload, "main_text", "mainText")
@@ -132,18 +135,41 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             )
         return {"food_name": food_name, "food_type": food_type, "ad_concept": ad_concept, "ad_req": ad_req}
 
-    if jt == "BASIC":
-        # ✅ BASIC은 “후보 이미지 생성”이 목적.
-        # 현재 최소 요구: n(후보 개수), prompt(optional)
-        n = int(pick(payload, "n", default=3) or 3)
+    if jt == "DIELINE":
         prompt = pick(payload, "prompt", "instruction", default="")
-        return {"n": n, "prompt": prompt}
+        concept_file = pick(payload, "concept_file", "conceptFile", default="concept_input.jpg")
+        return {"prompt": prompt, "concept_file": concept_file}
+
+    if jt == "BASIC":
+        # ✅ Spring이 보내는 구조: { n: 3, inputUrl: "gs://.../tmp/basic-input/xxx.png", prompt?: "" }
+        n = int(pick(payload, "n", default=3) or 3)
+        input_url = pick(payload, "inputUrl", "input_url", "inputURI", "inputUri")
+        if not input_url:
+            raise ValueError("BASIC payload missing: inputUrl (gs://...)")
+        prompt = pick(payload, "prompt", "instruction", default="")
+        return {"n": n, "inputUrl": input_url, "prompt": prompt}
 
     return payload
 
+
 # =========================
-# GCS upload
+# GCS helpers
 # =========================
+def parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
+    # gs://bucket/path/to.obj
+    if not gs_uri.startswith("gs://"):
+        raise ValueError(f"not gs uri: {gs_uri}")
+    no_scheme = gs_uri[len("gs://") :]
+    slash = no_scheme.find("/")
+    if slash < 0:
+        raise ValueError(f"invalid gs uri: {gs_uri}")
+    bucket = no_scheme[:slash]
+    obj = no_scheme[slash + 1 :]
+    if not obj:
+        raise ValueError(f"invalid gs uri object empty: {gs_uri}")
+    return bucket, obj
+
+
 class GcsUploader:
     def __init__(self, bucket: str, public_base_url: str):
         if not bucket:
@@ -172,6 +198,15 @@ class GcsUploader:
         gs_uri = f"gs://{self.bucket_name}/{object_name}"
         public_url = f"{self.public_base_url}/{object_name}"
         return gs_uri, public_url
+
+    def download_to_file(self, gs_uri: str, dest: Path) -> None:
+        bkt, obj = parse_gs_uri(gs_uri)
+        blob = self.client.bucket(bkt).blob(obj)
+        if not blob.exists():
+            raise FileNotFoundError(f"gcs object not found: {gs_uri}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        blob.download_to_filename(str(dest))
+
 
 # =========================
 # Runner
@@ -257,69 +292,73 @@ class JobRunner:
         out_path = Path(out)
         return out_path, f"{project_id}/video.mp4", "video/mp4"
 
-    # ✅ BASIC: 후보 이미지 n장 생성 + manifest.json 업로드(프론트가 바로 읽도록)
-    def run_basic(self, job_id: str, payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    # ✅ BASIC: inputUrl(gs://) 다운로드 → 후보 n장 생성 → 후보 업로드 → manifest 업로드
+    def run_basic(self, job_id: str, payload: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         """
-        반환:
-          - manifest_object_name (GCS object path)
-          - manifest_json (프론트가 읽을 candidates 포함)
-        전제:
-          - Spring이 worker가 참조할 "기반 이미지"를 어딘가에 준비해둬야 함.
-            (예: ai/tmp/{jobId}/input.png 를 미리 내려놓는 구조)
+        returns:
+          (manifest_gs_uri, manifest_public_url, manifest_json)
         """
         n = int(payload.get("n", 3))
-        # 기반 이미지: ai/tmp/{jobId}/input.png
+        input_url = payload.get("inputUrl")
+        if not input_url:
+            raise ValueError("BASIC payload missing inputUrl")
+
         tmp_dir = ensure_dir(AI_DIR / "tmp" / "basic" / job_id)
         input_path = tmp_dir / "input.png"
-        if not input_path.exists():
-            raise FileNotFoundError(f"Missing basic input image: {input_path}")
 
-        # 여기서 실제 후보 생성 로직이 필요함.
-        # 현재는 예시로 “PackageGenerator edit” 같은 걸로 1장만 만드는 건 의미가 없으니,
-        # 최소 동작: input을 그대로 n개 복사(placeholder) → 나중에 너 생성기로 교체.
+        # ✅ 핵심: inputUrl에서 내려받기
+        self.uploader.download_to_file(input_url, input_path)
+
+        # TODO: 여기 placeholder 복사 로직을 실제 “후보 생성기”로 교체해야 함.
+        # 지금은 파이프라인이 정상 동작하는지부터 확인하는 용도.
         candidates: List[Dict[str, Any]] = []
         for i in range(1, n + 1):
             out_path = tmp_dir / f"candidate_{i}.png"
-            out_path.write_bytes(input_path.read_bytes())  # placeholder
+            out_path.write_bytes(input_path.read_bytes())
 
             object_name = f"tmp/basic/{job_id}/candidate_{i}.png"
             _, url = self.uploader.upload_file(out_path, object_name, content_type="image/png")
-            candidates.append({
-                "id": f"c{i}",
-                "label": f"candidate {i}",
-                "url": url,
-                "meta": {"objectName": object_name},
-            })
+            candidates.append(
+                {
+                    "id": f"c{i}",
+                    "label": f"candidate {i}",
+                    "url": url,
+                    "meta": {"objectName": object_name},
+                }
+            )
 
         manifest = {"jobId": job_id, "candidates": candidates}
         manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
-        manifest_object = f"tmp/basic/{job_id}/manifest.json"
-        self.uploader.upload_bytes(manifest_bytes, manifest_object, content_type="application/json")
 
-        return manifest_object, manifest
+        manifest_object = f"tmp/basic/{job_id}/manifest.json"
+        manifest_gs, manifest_url = self.uploader.upload_bytes(
+            manifest_bytes, manifest_object, content_type="application/json"
+        )
+        return manifest_gs, manifest_url, manifest
 
     async def execute(self, job: Dict[str, Any]) -> Dict[str, Any]:
         job_type = str(job.get("jobType", "")).upper()
         project_id = int(job.get("projectId", 0) or 0)
         job_id = str(job.get("jobId") or "").strip()
+        if not job_id:
+            raise ValueError("jobId is empty")
+
         payload = job.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError(f"payload must be object, got {type(payload)}")
 
         payload_norm = normalize_payload(job_type, payload)
 
-        # ✅ BASIC은 projectId가 아직 없을 수 있음(너 요구상)
+        # ✅ BASIC은 projectId 없이도 동작
         if job_type == "BASIC":
-            manifest_object, manifest_json = self.run_basic(job_id, payload_norm)
-            output_uri = f"gs://{self.uploader.bucket_name}/{manifest_object}"
-            output_url = f"{self.uploader.public_base_url}/{manifest_object}"
+            manifest_gs, manifest_url, manifest_json = self.run_basic(job_id, payload_norm)
             return {
-                "outputUri": output_uri,
-                "outputUrl": output_url,
+                "outputUri": manifest_gs,
+                "outputUrl": manifest_url,
                 "meta": {"manifest": manifest_json},
             }
 
-        # 나머지는 기존대로 project_id 사용
+        # 나머지는 projectId 필수
         if project_id <= 0:
             raise ValueError("projectId is required for non-BASIC jobs")
 
