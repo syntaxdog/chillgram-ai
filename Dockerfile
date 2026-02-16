@@ -10,9 +10,12 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# pymatting의 numba cache 강제 사용 때문에 컨테이너에서 import 단계 크래시 발생 -> cache 비활성화 패치
-RUN sed -i 's/cache=True/cache=False/g' \
-  /usr/local/lib/python3.11/site-packages/pymatting/util/kdtree.py
+# ✅ pymatting 전체에서 njit(cache=True) 제거 (kdtree만 하면 boxfilter 등에서 또 터짐)
+RUN find /usr/local/lib/python3.11/site-packages/pymatting -name "*.py" -print0 \
+ | xargs -0 sed -i 's/cache=True/cache=False/g'
+
+# (선택) 빌드 단계에서 cache=True가 남았는지 검증 로그
+RUN grep -R "cache=True" -n /usr/local/lib/python3.11/site-packages/pymatting || true
 
 COPY . .
 
