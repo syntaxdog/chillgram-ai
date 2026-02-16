@@ -34,23 +34,50 @@ class PackageGenerator:
         original = Image.open(input_path).convert("RGBA")
         original = self._resize_if_needed(original, resize_long_side_px)
 
+        # --- [수정된 부분: 수량 제한(Single Object) 규칙 추가] ---
         prompt = f"""
-ACT AS: Expert Package Design Editor.
-TASK: Edit the provided image strictly according to the USER INSTRUCTION.
+ACT AS: Expert Product Designer and Photo Retoucher.
+TASK: Redesign the graphics ON the package while keeping the exact original package shape, then isolate it on a white background.
 
-CRITICAL RULES:
-1) OUTPUT: Return an edited image (not text).
-2) PRESERVATION: Keep original Brand Logo and Product Name text intact.
-3) CONSISTENCY: Maintain the main character identity while applying changes.
+CRITICAL RULES (FOLLOW IN ORDER):
+1. STRUCTURAL INTEGRITY (SHAPE & ORIENTATION) [MISSING PART ADDED]:
+   - The physical shape, outer contour, and ASPECT RATIO (height vs. width) of the package MUST remain 100% identical to the original input image.
+   - If the original is VERTICAL (Portrait), the output MUST be VERTICAL. Do NOT rotate, widen, or change the form factor.
+   - Treat the original package silhouette as a fixed canvas that cannot be resized.
+
+2. GRAPHIC REDESIGN (PRIMARY GOAL): 
+   - Dramatically change the graphics, colors, patterns, and background illustrations *ON* the product package surface according to the USER INSTRUCTION.
+
+3. UNIVERSAL PRESERVATION (SMART DETECTION): 
+   - Automatically IDENTIFY the **Main Brand Logo** and the **Primary Product Name**.
+   - These elements MUST remain legible, intact, and in their original relative positions.
+   - Do NOT change the text content or the logo shape.
+
+4. QUANTITY & COMPOSITION:
+   - Output EXACTLY ONE (1) single product package.
+   - Place it in the CENTER.
+
+5. ISOLATION & REMOVAL: 
+   - Remove the entire environmental background AND the hand/fingers. 
+   - Reconstruct hidden areas seamlessly.
+
+6. NEW BACKGROUND: 
+   - Place the package on a clean, solid WHITE background (hex #FFFFFF).
 
 USER INSTRUCTION:
 {instruction}
 """
+        # ------------------------------------------------------------------
+
+        # 창의성과 규칙 준수의 밸런스를 위해 0.6~0.7 유지
+        generation_config = types.GenerateContentConfig(
+            temperature=0.7
+        )
 
         response = self.client.models.generate_content(
             model=GEMINI_MODEL,
             contents=[prompt, original],
-            config=types.GenerateContentConfig(),
+            config=generation_config,
         )
 
         edited_img = None
