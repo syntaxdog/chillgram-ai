@@ -15,7 +15,7 @@ from services.banner_row import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
 from services.video_2 import generate_video_for_product
 from services.dieline_generate import DielineGenerator
-from services.package_generate import PackageGenerator  # ✅ 추가
+from services.package_generate import PackageGenerator
 
 load_dotenv()
 
@@ -78,7 +78,6 @@ def parse_job_message(raw: str) -> Dict[str, Any]:
     """
     outer = json.loads(raw)
 
-    # Debezium envelope
     if isinstance(outer, dict) and "schema" in outer and "payload" in outer:
         inner = outer["payload"]
         if isinstance(inner, str):
@@ -145,13 +144,16 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         concept_file = pick(payload, "concept_file", "conceptFile", default="package_input.png")
         return {"prompt": prompt, "concept_file": concept_file}
 
-    # ✅ BASIC = (기존 PACKAGE) 패키지 생성/편집
-    # Spring payload: { prompt: "..."} or { instruction: "..." }
+    # ✅ BASIC = 임시 미리보기 패키지 생성
+    # payload: { inputUrl: "gs://...", prompt: "..." }
     if jt == "BASIC":
+        input_url = pick(payload, "inputUrl", "input_url", "inputURI", "inputUri")
         prompt = pick(payload, "prompt", "instruction")
+        if not input_url:
+            raise ValueError("BASIC payload missing: inputUrl (gs://...)")
         if not prompt:
             raise ValueError("BASIC payload missing: prompt/instruction")
-        return {"prompt": prompt}
+        return {"inputUrl": input_url, "prompt": prompt}
 
     return payload
 
@@ -160,7 +162,6 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 # GCS helpers
 # =========================
 def parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
-    # gs://bucket/path/to.obj
     if not gs_uri.startswith("gs://"):
         raise ValueError(f"not gs uri: {gs_uri}")
     no_scheme = gs_uri[len("gs://") :]
@@ -185,7 +186,6 @@ class GcsUploader:
         self.client = storage.Client()
 
     def upload_file(self, local_path: Path, object_name: str, content_type: Optional[str] = None) -> Tuple[str, str]:
-        """returns (gs_uri, public_url)"""
         bucket = self.client.bucket(self.bucket_name)
         blob = bucket.blob(object_name)
         if content_type:
@@ -194,6 +194,14 @@ class GcsUploader:
         gs_uri = f"gs://{self.bucket_name}/{object_name}"
         public_url = f"{self.public_base_url}/{object_name}"
         return gs_uri, public_url
+
+    def download_to_file(self, gs_uri: str, dest: Path) -> None:
+        bkt, obj = parse_gs_uri(gs_uri)
+        blob = self.client.bucket(bkt).blob(obj)
+        if not blob.exists():
+            raise FileNotFoundError(f"gcs object not found: {gs_uri}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        blob.download_to_filename(str(dest))
 
 
 # =========================
@@ -208,13 +216,12 @@ class JobRunner:
     def run_banner(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
         input_path = d / "package.png"
-        
+
         if not input_path.exists():
             raise FileNotFoundError(f"{input_path} not found (package.png required)")
 
         gen = AdBannerGenerator(api_key=self.api_key, ratio=payload["ratio"])
-        
-        # Use fixed filename "banner.png" as requested
+
         filename = "banner.png"
         output_path = d / filename
 
@@ -222,7 +229,7 @@ class JobRunner:
             image_path=str(input_path),
             output_path=str(output_path),
             typo_text=payload["typo_text"],
-            guideline=payload["guideline"] or payload["headline"]
+            guideline=payload["guideline"] or payload["headline"],
         )
         return output_path, f"{project_id}/{filename}", "image/png"
 
@@ -284,25 +291,29 @@ class JobRunner:
         out_path = Path(out)
         return out_path, f"{project_id}/video.mp4", "video/mp4"
 
-    # ✅ BASIC: (기존 PACKAGE) package_input.png + prompt -> package.png 생성 후 업로드
-    def run_basic(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
-        d = ensure_project_dir(project_id)
-        input_path = d / "package_input.png"
-        output_path = d / "package.png"
-
-        if not input_path.exists():
-            raise FileNotFoundError(f"{input_path} not found (BASIC requires package_input.png)")
-
+    # ✅ BASIC(미리보기): jobId 기반 임시 폴더에서 생성 후 tmp/package/{jobId}/package.png 업로드
+    def run_basic_preview(self, job_id: str, payload: Dict[str, Any]) -> Tuple[str, str]:
+        input_gs = payload["inputUrl"]
         prompt = payload["prompt"]
 
+        tmp_dir = ensure_dir(AI_DIR / "tmp" / "package" / job_id)
+        input_path = tmp_dir / "package_input.png"
+        output_path = tmp_dir / "package.png"
+
+        # 1) inputUrl 다운로드
+        self.uploader.download_to_file(input_gs, input_path)
+
+        # 2) 패키지 생성/편집
         generator = PackageGenerator()
-        # 서비스 구현에 맞춰 호출 (너 기존 코드 기준)
-        generator.edit_package_image(product_dir=d, instruction=prompt)
+        generator.edit_package_image(product_dir=tmp_dir, instruction=prompt)
 
         if not output_path.exists():
             raise RuntimeError("package.png was not generated")
 
-        return output_path, f"{project_id}/package.png", "image/png"
+        # 3) GCS 업로드
+        object_name = f"tmp/package/{job_id}/package.png"
+        gs_uri, url = self.uploader.upload_file(output_path, object_name, content_type="image/png")
+        return gs_uri, url
 
     async def execute(self, job: Dict[str, Any]) -> Dict[str, Any]:
         job_type = str(job.get("jobType", "")).upper()
@@ -317,15 +328,12 @@ class JobRunner:
 
         payload_norm = normalize_payload(job_type, payload)
 
-        # ✅ BASIC도 projectId 필수 (패키지 생성이니까)
+        # ✅ BASIC: projectId=0 OK
         if job_type == "BASIC":
-            if project_id <= 0:
-                raise ValueError("projectId is required for BASIC")
-            local_path, obj, ct = self.run_basic(project_id, payload_norm)
-            gs_uri, url = self.uploader.upload_file(local_path, obj, content_type=ct)
+            gs_uri, url = self.run_basic_preview(job_id, payload_norm)
             return {"outputUri": gs_uri, "outputUrl": url}
 
-        # 나머지도 projectId 필수
+        # 나머지는 projectId 필수
         if project_id <= 0:
             raise ValueError("projectId is required for non-BASIC jobs")
 
