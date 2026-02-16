@@ -11,7 +11,7 @@ from aio_pika import DeliveryMode, Message, IncomingMessage
 from dotenv import load_dotenv
 from google.cloud import storage
 
-from services.banner_generate import AdBannerGenerator
+from services.banner_row import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
 from services.video_2 import generate_video_for_product
 from services.dieline_generate import DielineGenerator
@@ -102,9 +102,13 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if jt == "BANNER":
         headline = pick(payload, "headline")
         typo_text = pick(payload, "typo_text", "typoText")
+        ratio = pick(payload, "ratio", "Ratio")
+        guideline = pick(payload, "guideline", "Guideline", default="")
         if not headline or not typo_text:
-            raise ValueError(f"BANNER payload missing: headline={headline}, typoText={typo_text}")
-        return {"headline": headline, "typo_text": typo_text}
+            raise ValueError(f"BANNER payload 필수값 누락: headline={headline}, typoText={typo_text}")
+        if not ratio:
+            raise ValueError("BANNER payload 필수값 누락: ratio")
+        return {"headline": headline, "typo_text": typo_text, "ratio": ratio, "guideline": guideline}
 
     if jt == "SNS":
         main_text = pick(payload, "main_text", "mainText")
@@ -204,19 +208,23 @@ class JobRunner:
     def run_banner(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
         input_path = d / "package.png"
-        output_path = d / "banner.png"
-
+        
         if not input_path.exists():
             raise FileNotFoundError(f"{input_path} not found (package.png required)")
 
-        gen = AdBannerGenerator(api_key=self.api_key)
+        gen = AdBannerGenerator(api_key=self.api_key, ratio=payload["ratio"])
+        
+        # Use fixed filename "banner.png" as requested
+        filename = "banner.png"
+        output_path = d / filename
+
         gen.process(
             image_path=str(input_path),
-            headline=payload["headline"],
-            typo_text=payload["typo_text"],
             output_path=str(output_path),
+            typo_text=payload["typo_text"],
+            guideline=payload["guideline"] or payload["headline"]
         )
-        return output_path, f"{project_id}/banner.png", "image/png"
+        return output_path, f"{project_id}/{filename}", "image/png"
 
     def run_sns(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
