@@ -45,7 +45,8 @@ jobs:
           
               echo "📝 Creating .env file..."
               echo "${{ secrets.ENV_FILE }}" | sudo tee .env > /dev/null
-              sudo chmod 600 .env
+              # [수정 1] 권한을 644로 변경하여 컨테이너 유저(1005)가 읽을 수 있게 함
+              sudo chmod 644 .env
           
               echo "🔑 Creating GCS credentials..."
               sudo mkdir -p /opt/chillgram/secrets
@@ -74,7 +75,9 @@ jobs:
                 -v "$(pwd)/ai:/app/ai" \
                 -v /opt/chillgram/secrets/gcs.json:/secrets/gcs.json:ro \
                 -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs.json \
+                -e NUMBA_CACHE_DIR=/tmp \
                 python-worker
+              # [수정 2] 위 -e NUMBA_CACHE_DIR=/tmp 추가됨 (Numba 라이브러리 에러 해결)
           
               echo "📋 Container logs:"
               sleep 3
