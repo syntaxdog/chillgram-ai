@@ -4,7 +4,7 @@ import os
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Optional, List
+from typing import Any, Dict, Tuple, Optional
 
 import aio_pika
 from aio_pika import DeliveryMode, Message, IncomingMessage
@@ -15,6 +15,7 @@ from services.banner_generate import AdBannerGenerator
 from services.sns_image_generate import SNSImageGenerator
 from services.video_2 import generate_video_for_product
 from services.dieline_generate import DielineGenerator
+from services.package_generate import PackageGenerator  # ✅ 추가
 
 load_dotenv()
 
@@ -140,14 +141,13 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         concept_file = pick(payload, "concept_file", "conceptFile", default="package_input.png")
         return {"prompt": prompt, "concept_file": concept_file}
 
+    # ✅ BASIC = (기존 PACKAGE) 패키지 생성/편집
+    # Spring payload: { prompt: "..."} or { instruction: "..." }
     if jt == "BASIC":
-        # ✅ Spring이 보내는 구조: { n: 3, inputUrl: "gs://.../tmp/basic-input/xxx.png", prompt?: "" }
-        n = int(pick(payload, "n", default=3) or 3)
-        input_url = pick(payload, "inputUrl", "input_url", "inputURI", "inputUri")
-        if not input_url:
-            raise ValueError("BASIC payload missing: inputUrl (gs://...)")
-        prompt = pick(payload, "prompt", "instruction", default="")
-        return {"n": n, "inputUrl": input_url, "prompt": prompt}
+        prompt = pick(payload, "prompt", "instruction")
+        if not prompt:
+            raise ValueError("BASIC payload missing: prompt/instruction")
+        return {"prompt": prompt}
 
     return payload
 
@@ -190,22 +190,6 @@ class GcsUploader:
         gs_uri = f"gs://{self.bucket_name}/{object_name}"
         public_url = f"{self.public_base_url}/{object_name}"
         return gs_uri, public_url
-
-    def upload_bytes(self, data: bytes, object_name: str, content_type: str) -> Tuple[str, str]:
-        bucket = self.client.bucket(self.bucket_name)
-        blob = bucket.blob(object_name)
-        blob.upload_from_string(data, content_type=content_type)
-        gs_uri = f"gs://{self.bucket_name}/{object_name}"
-        public_url = f"{self.public_base_url}/{object_name}"
-        return gs_uri, public_url
-
-    def download_to_file(self, gs_uri: str, dest: Path) -> None:
-        bkt, obj = parse_gs_uri(gs_uri)
-        blob = self.client.bucket(bkt).blob(obj)
-        if not blob.exists():
-            raise FileNotFoundError(f"gcs object not found: {gs_uri}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        blob.download_to_filename(str(dest))
 
 
 # =========================
@@ -292,49 +276,25 @@ class JobRunner:
         out_path = Path(out)
         return out_path, f"{project_id}/video.mp4", "video/mp4"
 
-    # ✅ BASIC: inputUrl(gs://) 다운로드 → 후보 n장 생성 → 후보 업로드 → manifest 업로드
-    def run_basic(self, job_id: str, payload: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
-        """
-        returns:
-          (manifest_gs_uri, manifest_public_url, manifest_json)
-        """
-        n = int(payload.get("n", 3))
-        input_url = payload.get("inputUrl")
-        if not input_url:
-            raise ValueError("BASIC payload missing inputUrl")
+    # ✅ BASIC: (기존 PACKAGE) package_input.png + prompt -> package.png 생성 후 업로드
+    def run_basic(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
+        d = ensure_project_dir(project_id)
+        input_path = d / "package_input.png"
+        output_path = d / "package.png"
 
-        tmp_dir = ensure_dir(AI_DIR / "tmp" / "basic" / job_id)
-        input_path = tmp_dir / "input.png"
+        if not input_path.exists():
+            raise FileNotFoundError(f"{input_path} not found (BASIC requires package_input.png)")
 
-        # ✅ 핵심: inputUrl에서 내려받기
-        self.uploader.download_to_file(input_url, input_path)
+        prompt = payload["prompt"]
 
-        # TODO: 여기 placeholder 복사 로직을 실제 “후보 생성기”로 교체해야 함.
-        # 지금은 파이프라인이 정상 동작하는지부터 확인하는 용도.
-        candidates: List[Dict[str, Any]] = []
-        for i in range(1, n + 1):
-            out_path = tmp_dir / f"candidate_{i}.png"
-            out_path.write_bytes(input_path.read_bytes())
+        generator = PackageGenerator()
+        # 서비스 구현에 맞춰 호출 (너 기존 코드 기준)
+        generator.edit_package_image(product_dir=d, instruction=prompt)
 
-            object_name = f"tmp/basic/{job_id}/candidate_{i}.png"
-            _, url = self.uploader.upload_file(out_path, object_name, content_type="image/png")
-            candidates.append(
-                {
-                    "id": f"c{i}",
-                    "label": f"candidate {i}",
-                    "url": url,
-                    "meta": {"objectName": object_name},
-                }
-            )
+        if not output_path.exists():
+            raise RuntimeError("package.png was not generated")
 
-        manifest = {"jobId": job_id, "candidates": candidates}
-        manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
-
-        manifest_object = f"tmp/basic/{job_id}/manifest.json"
-        manifest_gs, manifest_url = self.uploader.upload_bytes(
-            manifest_bytes, manifest_object, content_type="application/json"
-        )
-        return manifest_gs, manifest_url, manifest
+        return output_path, f"{project_id}/package.png", "image/png"
 
     async def execute(self, job: Dict[str, Any]) -> Dict[str, Any]:
         job_type = str(job.get("jobType", "")).upper()
@@ -349,16 +309,15 @@ class JobRunner:
 
         payload_norm = normalize_payload(job_type, payload)
 
-        # ✅ BASIC은 projectId 없이도 동작
+        # ✅ BASIC도 projectId 필수 (패키지 생성이니까)
         if job_type == "BASIC":
-            manifest_gs, manifest_url, manifest_json = self.run_basic(job_id, payload_norm)
-            return {
-                "outputUri": manifest_gs,
-                "outputUrl": manifest_url,
-                "meta": {"manifest": manifest_json},
-            }
+            if project_id <= 0:
+                raise ValueError("projectId is required for BASIC")
+            local_path, obj, ct = self.run_basic(project_id, payload_norm)
+            gs_uri, url = self.uploader.upload_file(local_path, obj, content_type=ct)
+            return {"outputUri": gs_uri, "outputUrl": url}
 
-        # 나머지는 projectId 필수
+        # 나머지도 projectId 필수
         if project_id <= 0:
             raise ValueError("projectId is required for non-BASIC jobs")
 
@@ -384,6 +343,7 @@ class JobRunner:
 
         raise ValueError(f"unsupported jobType: {job_type}")
 
+
 # =========================
 # Result publisher
 # =========================
@@ -396,6 +356,7 @@ class ResultPublisher:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         msg = Message(body=body, content_type="application/json", delivery_mode=DeliveryMode.PERSISTENT)
         await self.channel.default_exchange.publish(msg, routing_key=self.result_queue)
+
 
 # =========================
 # Consumer
@@ -419,14 +380,16 @@ async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPub
 
             out = await runner.execute(job)
 
-            await pub.publish({
-                "jobId": job_id,
-                "success": True,
-                "outputUri": out.get("outputUri"),
-                "outputUrl": out.get("outputUrl"),
-                "errorCode": None,
-                "errorMessage": None,
-            })
+            await pub.publish(
+                {
+                    "jobId": job_id,
+                    "success": True,
+                    "outputUri": out.get("outputUri"),
+                    "outputUrl": out.get("outputUrl"),
+                    "errorCode": None,
+                    "errorMessage": None,
+                }
+            )
 
             print(json.dumps({"ok": True, "jobId": job_id, "output": out}, ensure_ascii=False), flush=True)
 
@@ -435,17 +398,20 @@ async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPub
             traceback.print_exc()
 
             try:
-                await pub.publish({
-                    "jobId": job_id,
-                    "success": False,
-                    "outputUri": None,
-                    "outputUrl": None,
-                    "errorCode": "WORKER_FAILED",
-                    "errorMessage": str(e) if e else "unknown error",
-                })
+                await pub.publish(
+                    {
+                        "jobId": job_id,
+                        "success": False,
+                        "outputUri": None,
+                        "outputUrl": None,
+                        "errorCode": "WORKER_FAILED",
+                        "errorMessage": str(e) if e else "unknown error",
+                    }
+                )
             except Exception:
                 print("[RESULT PUBLISH ERROR] failed to publish job result", flush=True)
                 traceback.print_exc()
+
 
 async def main():
     env = load_env()
@@ -475,6 +441,7 @@ async def main():
     await q.consume(lambda m: handle_message(m, runner, publisher))
 
     await asyncio.Future()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
