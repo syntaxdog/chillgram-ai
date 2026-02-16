@@ -59,7 +59,7 @@ jobs:
               sudo chmod -R 775 ai
           
               echo "🐳 Building Docker image..."
-              sudo docker build -t python-worker .
+              sudo docker build --no-cache -t python-worker:latest .
           
               echo "🛑 Stopping old container..."
               sudo docker stop python-worker 2>/dev/null || true
