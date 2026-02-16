@@ -137,7 +137,7 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if jt == "DIELINE":
         prompt = pick(payload, "prompt", "instruction", default="")
-        concept_file = pick(payload, "concept_file", "conceptFile", default="concept_input.jpg")
+        concept_file = pick(payload, "concept_file", "conceptFile", default="package_input.png")
         return {"prompt": prompt, "concept_file": concept_file}
 
     if jt == "BASIC":
@@ -260,7 +260,7 @@ class JobRunner:
     def run_dieline(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
         dieline_input = d / "dieline_input.png"
-        concept_input = d / payload.get("concept_file", "concept_input.jpg")
+        concept_input = d / payload.get("concept_file", "package_input.png")
         output_path = d / "dieline_result.png"
 
         if not dieline_input.exists():

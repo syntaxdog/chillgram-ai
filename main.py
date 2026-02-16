@@ -319,7 +319,7 @@ async def create_package_with_gemini(
 
     # 2. 파일 저장 
     dieline_path = product_dir / "dieline_input.png"
-    concept_path = product_dir / "concept_input.png"
+    concept_path = product_dir / "package_input.png"
 
     with dieline_path.open("wb") as buffer:
         shutil.copyfileobj(dieline_file.file, buffer)

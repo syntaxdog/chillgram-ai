@@ -654,7 +654,7 @@ if __name__ == "__main__":
     
     # Default values
     dieline_input = "dieline_input.png"
-    concept_input = "concept_input.png"
+    concept_input = "package_input.png"
     output_result = "dieline_result.png"
     
     # Parse arguments
