@@ -13,6 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
-ENV NUMBA_DISABLE_CACHING=1
+ENV NUMBA_DISABLE_CACHE=1
 
 CMD ["python", "rabbit_worker.py"]
