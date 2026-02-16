@@ -51,23 +51,22 @@ jobs:
               sudo mkdir -p /opt/chillgram/secrets
               sudo chmod 755 /opt/chillgram/secrets
               
-              # 기존 파일 삭제 (충돌 방지)
-              sudo rm -f /opt/chillgram/secrets/gcs.json
+              # 기존 파일 삭제
+              sudo rm -rf /opt/chillgram/secrets/gcs.json
 
-              # 시크릿에 저장된 경로에서 파일 복사
-              echo "Copying key from: ${{ secrets.GCP_WORKER_SA_KEY_JSON }}"
-              sudo cp "${{ secrets.GCP_WORKER_SA_KEY_JSON }}" /opt/chillgram/secrets/gcs.json
+              # JSON 내용을 파일로 저장
+              echo "${{ secrets.GCP_WORKER_SA_KEY_JSON }}" | sudo tee /opt/chillgram/secrets/gcs.json > /dev/null
               
-              # 모든 사용자가 읽을 수 있도록 설정 (권한 에러 원천 차단)
+              # 권한 설정 (모든 사용자 읽기 가능)
               sudo chmod 644 /opt/chillgram/secrets/gcs.json
               
-              # 권한 확인 (디버깅용)
+              # 권한 확인
               echo "🔍 Checking file permissions..."
               sudo ls -la /opt/chillgram/secrets/gcs.json
               
-              # JSON 파일 문법 검증
+              # JSON 문법 검증
               if ! sudo python3 -m json.tool /opt/chillgram/secrets/gcs.json > /dev/null 2>&1; then
-                echo "❌ Invalid GCS credentials JSON (Copy failed or invalid file)"
+                echo "❌ Invalid GCS credentials JSON"
                 sudo head -n 3 /opt/chillgram/secrets/gcs.json
                 exit 1
               fi
