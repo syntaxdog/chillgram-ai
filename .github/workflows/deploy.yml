@@ -1,120 +1,59 @@
-name: Deploy Python Worker to GCP
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Set GCP Project
-        run: |
-          gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
-
-      - name: Deploy to VM
-        run: |
-          gcloud compute ssh chillgram-pythonworker \
-            --zone=us-west1-b \
-            --tunnel-through-iap \
-            --command="bash -lc '
-              set -e
-
-              echo \"🚀 Starting deployment...\"
-
-              # 0) 컨테이너 먼저 내리기
-              echo \"🛑 Stopping old container...\"
-              sudo docker stop python-worker 2>/dev/null || true
-              sudo docker rm -f python-worker 2>/dev/null || true
-
-              cd ~
-
-              # 1) 기존 디렉토리 강제 제거
-              echo \"🧹 Removing old CHILLGRAM_AI...\"
-              sudo rm -rf CHILLGRAM_AI || true
-
-              # 2) clone
-              echo \"📥 Cloning repository...\"
-              git clone https://github.com/${{ github.repository }}.git CHILLGRAM_AI
-              cd CHILLGRAM_AI
-
-              # 3) .env 생성 (heredoc 금지: YAML 깨짐 방지)
-              echo \"📝 Creating .env file...\"
-              printf \"%s\" \"${{ secrets.ENV_FILE }}\" | sudo tee .env >/dev/null
-              sudo chmod 600 .env
-
-              # 4) GCS credentials 생성 (heredoc 금지)
-              echo \"🔑 Creating GCS credentials...\"
-              sudo mkdir -p /opt/chillgram/secrets
-              sudo chmod 700 /opt/chillgram/secrets
-              printf \"%s\" \"${{ secrets.GCP_WORKER_SA_KEY_JSON }}\" | sudo tee /opt/chillgram/secrets/gcs.json >/dev/null
-              sudo chmod 600 /opt/chillgram/secrets/gcs.json
-
-              # 5) 마운트될 ai 디렉토리 권한 보정
-              echo \"🔧 Fixing permissions for ./ai volume...\"
-              sudo mkdir -p ai/tmp/basic
-              sudo chown -R 1005:1006 ai
-              sudo chmod -R 775 ai
-
-              echo \"== DEBUG CHECK ==\"
-              echo \"pwd=$(pwd)\"
-              ls -ld ai ai/tmp ai/tmp/basic || true
-              sudo ls -al .env || true
-              sudo ls -al /opt/chillgram/secrets || true
-
-              # 6) build
-              echo \"🐳 Building Docker image...\"
-              sudo docker build -t python-worker .
-
-              # 7) run (non-root)
-              echo \"▶️ Starting new container...\"
-              sudo docker run -d \
-                --name python-worker \
-                --restart always \
-                --user 1005:1006 \
-                --env-file $(pwd)/.env \
-                -v $(pwd)/ai:/app/ai \
-                -v /opt/chillgram/secrets/gcs.json:/secrets/gcs.json:ro \
-                -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs.json \
-                python-worker
-
-              echo \"📋 Container logs:\"
-              sleep 3
-              sudo docker logs python-worker --tail 50
-
-              echo \"✅ Deployment complete!\"
-            '"
-
-      - name: Verify Deployment
-        run: |
-          gcloud compute ssh chillgram-pythonworker \
-            --zone=us-west1-b \
-            --tunnel-through-iap \
-            --command="bash -lc '
-              set -e
-              echo \"== docker ps (filtered) ==\"
-              sudo docker ps --filter \"name=^/python-worker$\" --format \"table {{.Names}}\t{{.Status}}\t{{.Image}}\"
-
-              if sudo docker ps --filter \"name=^/python-worker$\" --format \"{{.Names}}\" | grep -qx \"python-worker\"; then
-                echo \"✅ python-worker is running\"
-              else
-                echo \"❌ python-worker is NOT running\"
-                sudo docker ps -a --filter \"name=^/python-worker$\" --format \"table {{.Names}}\t{{.Status}}\t{{.Image}}\"
-                echo \"== last logs ==\"
-                sudo docker logs python-worker --tail 200 || true
-                exit 1
-              fi
-            '"
+- name: Deploy to VM
+  run: |
+    gcloud compute ssh chillgram-pythonworker \
+      --zone=us-west1-b \
+      --tunnel-through-iap \
+      --command "bash -lc 'cat > /tmp/deploy_python_worker.sh <<\"SCRIPT\"
+  set -euo pipefail
+  
+  echo \"🚀 Starting deployment...\"
+  
+  echo \"🛑 Stopping old container...\"
+  sudo docker stop python-worker 2>/dev/null || true
+  sudo docker rm -f python-worker 2>/dev/null || true
+  
+  cd ~
+  echo \"🧹 Removing old CHILLGRAM_AI...\"
+  sudo rm -rf CHILLGRAM_AI || true
+  
+  echo \"📥 Cloning repository...\"
+  git clone https://github.com/${{ github.repository }}.git CHILLGRAM_AI
+  cd CHILLGRAM_AI
+  
+  echo \"📝 Creating .env file...\"
+  printf \"%s\" \"${{ secrets.ENV_FILE }}\" | sudo tee .env >/dev/null
+  sudo chmod 600 .env
+  
+  echo \"🔑 Creating GCS credentials...\"
+  sudo mkdir -p /opt/chillgram/secrets
+  sudo chmod 700 /opt/chillgram/secrets
+  printf \"%s\" \"${{ secrets.GCP_WORKER_SA_KEY_JSON }}\" | sudo tee /opt/chillgram/secrets/gcs.json >/dev/null
+  sudo chmod 600 /opt/chillgram/secrets/gcs.json
+  
+  echo \"🔧 Fixing permissions for ./ai volume...\"
+  sudo mkdir -p ai/tmp/basic
+  sudo chown -R 1005:1006 ai
+  sudo chmod -R 775 ai
+  
+  echo \"🐳 Building Docker image...\"
+  sudo docker build -t python-worker .
+  
+  echo \"▶️ Starting new container...\"
+  sudo docker run -d \
+  --name python-worker \
+  --restart always \
+  --user 1005:1006 \
+  --env-file \"$(pwd)/.env\" \
+  -v \"$(pwd)/ai:/app/ai\" \
+  -v /opt/chillgram/secrets/gcs.json:/secrets/gcs.json:ro \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs.json \
+  python-worker
+  
+  echo \"📋 Container logs:\"
+  sleep 3
+  sudo docker logs python-worker --tail 50 || true
+  
+  echo \"✅ Deployment complete!\"
+  SCRIPT
+  chmod +x /tmp/deploy_python_worker.sh
+  bash /tmp/deploy_python_worker.sh'"
