@@ -3,7 +3,10 @@
     gcloud compute ssh chillgram-pythonworker \
       --zone=us-west1-b \
       --tunnel-through-iap \
-      --command "bash -lc 'cat > /tmp/deploy_python_worker.sh <<\"SCRIPT\"
+      --command 'bash -lc "
+  set -euo pipefail
+  
+  cat > /tmp/deploy_python_worker.sh <<'\''SCRIPT'\''
   set -euo pipefail
   
   echo \"🚀 Starting deployment...\"
@@ -55,5 +58,7 @@
   
   echo \"✅ Deployment complete!\"
   SCRIPT
+  
   chmod +x /tmp/deploy_python_worker.sh
-  bash /tmp/deploy_python_worker.sh'"
+  bash /tmp/deploy_python_worker.sh
+  "'
