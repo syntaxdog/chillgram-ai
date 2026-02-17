@@ -4,15 +4,21 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-GEMINI_API_KEY = "AIzaSyDIQ0AoxpM8i14ZZ-x6Ey_VdmWyXJsLw5I"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3-pro-image-preview"
 
 
 class PackageGenerator:
-    def __init__(self):
-        if not GEMINI_API_KEY:
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or GEMINI_API_KEY
+        if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY가 설정되지 않았습니다.")
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        self.client = genai.Client(api_key=self.api_key)
 
     def edit_package_image(
         self,
