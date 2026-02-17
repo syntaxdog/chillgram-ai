@@ -144,15 +144,27 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         concept_file = pick(payload, "concept_file", "conceptFile", default="package_input.png")
         return {"prompt": prompt, "concept_file": concept_file}
 
-    # ✅ BASIC = 임시 미리보기 패키지 생성
-    # payload: { inputUrl: "<https or gs>", prompt: "..." }
+    sub_type = pick(payload, "subType", "sub_type")
+    if sub_type == "DIELINE":
+
+        input_url = pick(payload, "inputUrl", "input_url", "inputURI", "inputUri")
+        prompt = pick(payload, "prompt", "instruction", default="")
+        concept_url = pick(payload, "conceptUrl", "concept_url")
+
+        return {
+            "subType": "DIELINE",
+            "inputUrl": input_url,
+            "prompt": prompt,
+            "conceptUrl": concept_url
+        }
+
     if jt == "BASIC":
         input_url = pick(payload, "inputUrl", "input_url", "inputURI", "inputUri")
-        prompt = pick(payload, "prompt", "instruction")
+        prompt = pick(payload, "prompt", "instruction", default="")
+
         if not input_url:
             raise ValueError("BASIC payload missing: inputUrl")
-        if not prompt:
-            raise ValueError("BASIC payload missing: prompt/instruction")
+
         return {"inputUrl": input_url, "prompt": prompt}
 
     return payload
@@ -307,11 +319,37 @@ class JobRunner:
         )
         return final_path, f"{project_id}/sns.png", "image/png"
 
-    def run_dieline(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
-        d = ensure_project_dir(project_id)
-        dieline_input = d / "dieline_input.png"
-        concept_input = d / payload.get("concept_file", "package_input.png")
-        output_path = d / "dieline_result.png"
+    def run_dieline(self, project_id: int, payload: Dict[str, Any], job_id: Optional[str] = None) -> Tuple[Path, str, str]:
+        """
+        job_id가 있으면(미리보기/Basic) -> ai/tmp/package/{job_id}/ 사용
+        job_id가 없으면(프로젝트 저장) -> ai/{project_id}/ 사용
+        """
+        if job_id:
+            # 임시 디렉토리 (BASIC 미리보기)
+            d = ensure_dir(AI_DIR / "tmp" / "package" / job_id)
+            # BASIC 로직에서 다운로드 받은 파일명들과 맞춤
+            dieline_input = d / "dieline_input.png"
+            concept_input = d / "concept_input.png"
+            output_path = d / "package.png" # BASIC은 package.png로 리턴 기대 (run_basic_preview 참조)
+
+            # 파일 다운로드 (run_basic_preview에 있던 로직 이관)
+            input_uri = payload.get("inputUrl")
+            if input_uri:
+                self.uploader.download_to_file(input_uri, dieline_input)
+
+            concept_uri = payload.get("conceptUrl")
+            if concept_uri:
+                self.uploader.download_to_file(concept_uri, concept_input)
+
+            object_name_suffix = f"tmp/package/{job_id}/package.png"
+
+        else:
+            # 프로젝트 영구 저장
+            d = ensure_project_dir(project_id)
+            dieline_input = d / "dieline_input.png"
+            concept_input = d / payload.get("concept_file", "package_input.png")
+            output_path = d / "dieline_result.png"
+            object_name_suffix = f"{project_id}/dieline_result.png"
 
         if not dieline_input.exists():
             raise FileNotFoundError(f"Missing: {dieline_input}")
@@ -324,7 +362,7 @@ class JobRunner:
             concept_path=str(concept_input),
             output_path=str(output_path),
         )
-        return output_path, f"{project_id}/dieline_result.png", "image/png"
+        return output_path, object_name_suffix, "image/png"
 
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
@@ -346,17 +384,26 @@ class JobRunner:
     def run_basic_preview(self, job_id: str, payload: Dict[str, Any]) -> str:
         input_uri = payload["inputUrl"]
         prompt = payload["prompt"]
+        sub_type = payload.get("subType")
 
         tmp_dir = ensure_dir(AI_DIR / "tmp" / "package" / job_id)
-        input_path = tmp_dir / "package_input.png"
         output_path = tmp_dir / "package.png"
 
+        input_path = tmp_dir / "package_input.png"
         # 1) inputUrl 다운로드 (gs/http 모두 지원)
         self.uploader.download_to_file(input_uri, input_path)
 
         # 2) 패키지 생성/편집
         generator = PackageGenerator()
         generator.edit_package_image(product_dir=tmp_dir, instruction=prompt)
+
+        if not output_path.exists():
+            raise RuntimeError("package.png was not generated")
+
+        # 3) GCS 업로드 (✅ public https url만 리턴)
+        object_name = f"tmp/package/{job_id}/package.png"
+        url = self.uploader.upload_file(output_path, object_name, content_type="image/png")
+        return url
 
         if not output_path.exists():
             raise RuntimeError("package.png was not generated")
@@ -379,8 +426,17 @@ class JobRunner:
 
         payload_norm = normalize_payload(job_type, payload)
 
+        # ✅ (수정) DIELINE subType 우선 인터셉트 (BASIC 로직 오염 방지)
+        if payload_norm.get("subType") == "DIELINE":
+            # BASIC 타입으로 들어왔더라도 DIELINE이면 run_dieline으로 납치
+            # job_id가 있으면 preview 모드(tmp 저장), 없으면 project 모드
+            out_path, obj_suffix, ct = self.run_dieline(project_id, payload_norm, job_id=job_id)
+            url = self.uploader.upload_file(out_path, obj_suffix, content_type=ct)
+            return {"outputUri": url}
+
         # ✅ BASIC: projectId=0 OK (outputUri = https)
         if job_type == "BASIC":
+            # 기존 로직 원복
             url = self.run_basic_preview(job_id, payload_norm)
             return {"outputUri": url}
 
