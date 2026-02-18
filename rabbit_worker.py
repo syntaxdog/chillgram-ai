@@ -107,25 +107,35 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     jt = job_type.upper()
 
     if jt == "BANNER":
-        headline = pick(payload, "headline")
-        typo_text = pick(payload, "typo_text", "typoText")
-        ratio = pick(payload, "ratio", "Ratio")
+        # headline 제거 (사용 안함)
+        typo_text = pick(payload, "typo_text", "typoText", "finalCopy")
+        ratio = pick(payload, "ratio", "Ratio", "bannerRatio")
         guideline = pick(payload, "guideline", "Guideline", default="")
-        if not headline or not typo_text:
-            raise ValueError(f"BANNER payload 필수값 누락: headline={headline}, typoText={typo_text}")
+        base_image_url = pick(payload, "baseImageUrl", "base_image_url")
+
+        if not typo_text:
+            raise ValueError(f"BANNER payload 필수값 누락: typoText (Available keys: {list(payload.keys())})")
         if not ratio:
-            raise ValueError("BANNER payload 필수값 누락: ratio")
-        return {"headline": headline, "typo_text": typo_text, "ratio": ratio, "guideline": guideline}
+            raise ValueError(f"BANNER payload 필수값 누락: ratio (Available keys: {list(payload.keys())})")
+        
+        return {
+            "typo_text": typo_text, 
+            "ratio": ratio, 
+            "guideline": guideline,
+            "baseImageUrl": base_image_url
+        }
 
     if jt == "SNS":
-        main_text = pick(payload, "main_text", "mainText")
+        main_text = pick(payload, "main_text", "mainText", "finalCopy")
         sub_text = pick(payload, "sub_text", "subText", default="")
         preset = pick(payload, "preset")
         custom_prompt = pick(payload, "custom_prompt", "customPrompt")
         guideline = pick(payload, "guideline")
         save_background = pick(payload, "save_background", "saveBackground", default=True)
+        base_image_url = pick(payload, "baseImageUrl", "base_image_url")
+
         if not main_text:
-            raise ValueError("SNS payload missing: mainText/main_text")
+            raise ValueError(f"SNS payload missing: mainText/main_text (Available keys: {list(payload.keys())})")
         return {
             "main_text": main_text,
             "sub_text": sub_text or "",
@@ -133,6 +143,7 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "custom_prompt": custom_prompt,
             "guideline": guideline,
             "save_background": bool(save_background),
+            "baseImageUrl": base_image_url
         }
 
     if jt == "VIDEO":
@@ -285,6 +296,12 @@ class JobRunner:
         d = ensure_project_dir(project_id)
         input_path = d / "package.png"
 
+        # ✅ baseImageUrl 다운로드 로직 추가
+        base_image_url = payload.get("baseImageUrl")
+        if not input_path.exists() and base_image_url:
+            print(f"[BANNER] Downloading base image from {base_image_url}", flush=True)
+            self.uploader.download_to_file(base_image_url, input_path)
+
         if not input_path.exists():
             raise FileNotFoundError(f"{input_path} not found (package.png required)")
 
@@ -297,7 +314,7 @@ class JobRunner:
             image_path=str(input_path),
             output_path=str(output_path),
             typo_text=payload["typo_text"],
-            guideline=payload["guideline"] or payload["headline"],
+            guideline=payload.get("guideline", ""),
         )
         return output_path, f"{project_id}/{filename}", "image/png"
 
@@ -394,7 +411,6 @@ class JobRunner:
         # 2) 패키지 생성/편집
         generator = PackageGenerator()
         generator.edit_package_image(product_dir=tmp_dir, instruction=prompt)
-
         if not output_path.exists():
             raise RuntimeError("package.png was not generated")
 
