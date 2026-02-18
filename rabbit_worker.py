@@ -31,6 +31,8 @@ class Env:
     gcs_bucket: str
     video_timeout_sec: int
     gcs_public_base_url: str  # 예: https://storage.googleapis.com/<bucket>
+    prefetch_count: int
+    worker_concurrency: int
 
 
 def load_env() -> Env:
@@ -38,6 +40,10 @@ def load_env() -> Env:
     public_base = os.getenv("GCS_PUBLIC_BASE_URL", "").strip()
     if not public_base and bucket:
         public_base = f"https://storage.googleapis.com/{bucket}"
+
+    worker_conc = int(os.getenv("WORKER_CONCURRENCY", "4"))
+    prefetch = int(os.getenv("RABBITMQ_PREFETCH", str(max(worker_conc, worker_conc * 2))))
+
     return Env(
         api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         rabbitmq_url=os.getenv("RABBITMQ_URL", "").strip(),
@@ -46,6 +52,8 @@ def load_env() -> Env:
         gcs_bucket=bucket,
         video_timeout_sec=int(os.getenv("VIDEO_TIMEOUT_SEC", "900")),
         gcs_public_base_url=public_base,
+        prefetch_count=prefetch,
+        worker_concurrency=worker_conc,
     )
 
 
@@ -146,25 +154,21 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     sub_type = pick(payload, "subType", "sub_type")
     if sub_type == "DIELINE":
-
         input_url = pick(payload, "inputUrl", "input_url", "inputURI", "inputUri")
         prompt = pick(payload, "prompt", "instruction", default="")
         concept_url = pick(payload, "conceptUrl", "concept_url")
-
         return {
             "subType": "DIELINE",
             "inputUrl": input_url,
             "prompt": prompt,
-            "conceptUrl": concept_url
+            "conceptUrl": concept_url,
         }
 
     if jt == "BASIC":
         input_url = pick(payload, "inputUrl", "input_url", "inputURI", "inputUri")
         prompt = pick(payload, "prompt", "instruction", default="")
-
         if not input_url:
             raise ValueError("BASIC payload missing: inputUrl")
-
         return {"inputUrl": input_url, "prompt": prompt}
 
     return payload
@@ -276,6 +280,7 @@ class JobRunner:
         self.uploader = uploader
         self.video_timeout_sec = video_timeout_sec
 
+    # ---- sync runners (원본) ----
     def run_banner(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
         input_path = d / "package.png"
@@ -325,14 +330,11 @@ class JobRunner:
         job_id가 없으면(프로젝트 저장) -> ai/{project_id}/ 사용
         """
         if job_id:
-            # 임시 디렉토리 (BASIC 미리보기)
             d = ensure_dir(AI_DIR / "tmp" / "package" / job_id)
-            # BASIC 로직에서 다운로드 받은 파일명들과 맞춤
             dieline_input = d / "dieline_input.png"
             concept_input = d / "concept_input.png"
-            output_path = d / "package.png" # BASIC은 package.png로 리턴 기대 (run_basic_preview 참조)
+            output_path = d / "package.png"  # BASIC은 package.png로 리턴 기대
 
-            # 파일 다운로드 (run_basic_preview에 있던 로직 이관)
             input_uri = payload.get("inputUrl")
             if input_uri:
                 self.uploader.download_to_file(input_uri, dieline_input)
@@ -342,9 +344,7 @@ class JobRunner:
                 self.uploader.download_to_file(concept_uri, concept_input)
 
             object_name_suffix = f"tmp/package/{job_id}/package.png"
-
         else:
-            # 프로젝트 영구 저장
             d = ensure_project_dir(project_id)
             dieline_input = d / "dieline_input.png"
             concept_input = d / payload.get("concept_file", "package_input.png")
@@ -380,11 +380,9 @@ class JobRunner:
         out_path = Path(out)
         return out_path, f"{project_id}/video.mp4", "video/mp4"
 
-    # ✅ BASIC(미리보기): jobId 기반 임시 폴더에서 생성 후 tmp/package/{jobId}/package.png 업로드
     def run_basic_preview(self, job_id: str, payload: Dict[str, Any]) -> str:
         input_uri = payload["inputUrl"]
         prompt = payload["prompt"]
-        sub_type = payload.get("subType")
 
         tmp_dir = ensure_dir(AI_DIR / "tmp" / "package" / job_id)
         output_path = tmp_dir / "package.png"
@@ -405,13 +403,12 @@ class JobRunner:
         url = self.uploader.upload_file(output_path, object_name, content_type="image/png")
         return url
 
-        if not output_path.exists():
-            raise RuntimeError("package.png was not generated")
+    # ---- async wrappers: blocking 작업을 thread로 ----
+    async def _to_thread(self, fn, *args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
-        # 3) GCS 업로드 (✅ public https url만 리턴)
-        object_name = f"tmp/package/{job_id}/package.png"
-        url = self.uploader.upload_file(output_path, object_name, content_type="image/png")
-        return url
+    async def upload_file_async(self, local_path: Path, object_name: str, content_type: Optional[str] = None) -> str:
+        return await self._to_thread(self.uploader.upload_file, local_path, object_name, content_type)
 
     async def execute(self, job: Dict[str, Any]) -> Dict[str, Any]:
         job_type = str(job.get("jobType", "")).upper()
@@ -428,16 +425,14 @@ class JobRunner:
 
         # ✅ (수정) DIELINE subType 우선 인터셉트 (BASIC 로직 오염 방지)
         if payload_norm.get("subType") == "DIELINE":
-            # BASIC 타입으로 들어왔더라도 DIELINE이면 run_dieline으로 납치
-            # job_id가 있으면 preview 모드(tmp 저장), 없으면 project 모드
-            out_path, obj_suffix, ct = self.run_dieline(project_id, payload_norm, job_id=job_id)
-            url = self.uploader.upload_file(out_path, obj_suffix, content_type=ct)
+            # run_dieline은 blocking + GCS download 포함 -> thread
+            out_path, obj_suffix, ct = await self._to_thread(self.run_dieline, project_id, payload_norm, job_id)
+            url = await self.upload_file_async(out_path, obj_suffix, content_type=ct)
             return {"outputUri": url}
 
         # ✅ BASIC: projectId=0 OK (outputUri = https)
         if job_type == "BASIC":
-            # 기존 로직 원복
-            url = self.run_basic_preview(job_id, payload_norm)
+            url = await self._to_thread(self.run_basic_preview, job_id, payload_norm)
             return {"outputUri": url}
 
         # 나머지는 projectId 필수
@@ -445,23 +440,18 @@ class JobRunner:
             raise ValueError("projectId is required for non-BASIC jobs")
 
         if job_type == "BANNER":
-            local_path, obj, ct = self.run_banner(project_id, payload_norm)
-            url = self.uploader.upload_file(local_path, obj, content_type=ct)
+            local_path, obj, ct = await self._to_thread(self.run_banner, project_id, payload_norm)
+            url = await self.upload_file_async(local_path, obj, content_type=ct)
             return {"outputUri": url}
 
         if job_type == "SNS":
-            local_path, obj, ct = self.run_sns(project_id, payload_norm)
-            url = self.uploader.upload_file(local_path, obj, content_type=ct)
+            local_path, obj, ct = await self._to_thread(self.run_sns, project_id, payload_norm)
+            url = await self.upload_file_async(local_path, obj, content_type=ct)
             return {"outputUri": url}
 
         if job_type == "VIDEO":
             local_path, obj, ct = await self.run_video(project_id, payload_norm)
-            url = self.uploader.upload_file(local_path, obj, content_type=ct)
-            return {"outputUri": url}
-
-        if job_type == "DIELINE":
-            local_path, obj, ct = self.run_dieline(project_id, payload_norm)
-            url = self.uploader.upload_file(local_path, obj, content_type=ct)
+            url = await self.upload_file_async(local_path, obj, content_type=ct)
             return {"outputUri": url}
 
         raise ValueError(f"unsupported jobType: {job_type}")
@@ -484,55 +474,57 @@ class ResultPublisher:
 # =========================
 # Consumer
 # =========================
-async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPublisher):
+async def handle_message(msg: IncomingMessage, runner: JobRunner, pub: ResultPublisher, sem: asyncio.Semaphore):
     raw = msg.body.decode("utf-8", errors="replace")
     print(f"[RECEIVED] {raw}", flush=True)
 
-    async with msg.process(requeue=False):
-        job_id = ""
-        try:
-            job = parse_job_message(raw)
-
-            job_id = str(job.get("jobId") or "").strip()
-            if not job_id:
-                raise ValueError("jobId is empty")
-
-            jt = str(job.get("jobType", "")).upper()
-            pid = job.get("projectId")
-            print(f"[JOB START] jobId={job_id} type={jt} projectId={pid}", flush=True)
-
-            out = await runner.execute(job)
-
-            # ✅ outputUri만 보냄 (gs:// 제거)
-            await pub.publish(
-                {
-                    "jobId": job_id,
-                    "success": True,
-                    "outputUri": out.get("outputUri"),
-                    "errorCode": None,
-                    "errorMessage": None,
-                }
-            )
-
-            print(json.dumps({"ok": True, "jobId": job_id, "output": out}, ensure_ascii=False), flush=True)
-
-        except Exception as e:
-            print("[JOB ERROR] job failed", flush=True)
-            traceback.print_exc()
-
+    # ✅ 동시 처리량 제한
+    async with sem:
+        async with msg.process(requeue=False):
+            job_id = ""
             try:
+                job = parse_job_message(raw)
+
+                job_id = str(job.get("jobId") or "").strip()
+                if not job_id:
+                    raise ValueError("jobId is empty")
+
+                jt = str(job.get("jobType", "")).upper()
+                pid = job.get("projectId")
+                print(f"[JOB START] jobId={job_id} type={jt} projectId={pid}", flush=True)
+
+                out = await runner.execute(job)
+
+                # ✅ outputUri만 보냄 (gs:// 제거)
                 await pub.publish(
                     {
                         "jobId": job_id,
-                        "success": False,
-                        "outputUri": None,
-                        "errorCode": "WORKER_FAILED",
-                        "errorMessage": str(e) if e else "unknown error",
+                        "success": True,
+                        "outputUri": out.get("outputUri"),
+                        "errorCode": None,
+                        "errorMessage": None,
                     }
                 )
-            except Exception:
-                print("[RESULT PUBLISH ERROR] failed to publish job result", flush=True)
+
+                print(json.dumps({"ok": True, "jobId": job_id, "output": out}, ensure_ascii=False), flush=True)
+
+            except Exception as e:
+                print("[JOB ERROR] job failed", flush=True)
                 traceback.print_exc()
+
+                try:
+                    await pub.publish(
+                        {
+                            "jobId": job_id,
+                            "success": False,
+                            "outputUri": None,
+                            "errorCode": "WORKER_FAILED",
+                            "errorMessage": str(e) if e else "unknown error",
+                        }
+                    )
+                except Exception:
+                    print("[RESULT PUBLISH ERROR] failed to publish job result", flush=True)
+                    traceback.print_exc()
 
 
 async def main():
@@ -546,11 +538,17 @@ async def main():
     if not env.gcs_public_base_url:
         raise ValueError("GCS_PUBLIC_BASE_URL is empty")
 
-    print(f"Starting consumer: url={env.rabbitmq_url} jobs={env.queue_jobs} results={env.queue_results}", flush=True)
+    print(
+        f"Starting consumer: url={env.rabbitmq_url} jobs={env.queue_jobs} results={env.queue_results} "
+        f"prefetch={env.prefetch_count} concurrency={env.worker_concurrency}",
+        flush=True,
+    )
 
     connection = await aio_pika.connect_robust(env.rabbitmq_url)
     channel = await connection.channel()
-    await channel.set_qos(prefetch_count=10)
+
+    # ✅ prefetch는 동시 처리량(sem)과 비슷하게/약간 크게
+    await channel.set_qos(prefetch_count=env.prefetch_count)
 
     await channel.declare_queue(env.queue_jobs, durable=True)
     await channel.declare_queue(env.queue_results, durable=True)
@@ -559,8 +557,10 @@ async def main():
     runner = JobRunner(env.api_key, uploader, video_timeout_sec=env.video_timeout_sec)
     publisher = ResultPublisher(channel, env.queue_results)
 
+    sem = asyncio.Semaphore(env.worker_concurrency)
+
     q = await channel.get_queue(env.queue_jobs)
-    await q.consume(lambda m: handle_message(m, runner, publisher))
+    await q.consume(lambda m: handle_message(m, runner, publisher, sem))
 
     await asyncio.Future()
 
