@@ -118,7 +118,7 @@ async def upload_image_to_hosting(image_path: str | Path) -> str:
     raise RuntimeError("Image upload failed")
 
 def _ensure_product_dir(product_id: int) -> Path:
-    d = BASE_DIR / str(product_id)
+    d = AI_DIR / str(product_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
