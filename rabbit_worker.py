@@ -147,16 +147,22 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if jt == "VIDEO":
+    if jt == "VIDEO":
         food_name = pick(payload, "food_name", "foodName")
         food_type = pick(payload, "food_type", "foodType")
         ad_concept = pick(payload, "ad_concept", "adConcept")
         ad_req = pick(payload, "ad_req", "adReq")
-        if not (food_name and food_type and ad_concept and ad_req):
-            raise ValueError(
-                "VIDEO payload must match VideoGenRequest: "
-                "{food_name/foodName, food_type/foodType, ad_concept/adConcept, ad_req/adReq}"
-            )
-        return {"food_name": food_name, "food_type": food_type, "ad_concept": ad_concept, "ad_req": ad_req}
+        
+        # [수정] 필수값이 없더라도, 이미지가 있으면 video_2.py에서 자동 추론하도록 허용
+        # 최소한의 식별자(baseImageUrl)는 있어야 함 (또는 이미 다운로드된 package.png)
+        # return raw payload keys if missing, so video_2.py handles defaults
+        return {
+            "food_name": food_name, 
+            "food_type": food_type, 
+            "ad_concept": ad_concept, 
+            "ad_req": ad_req,
+            "baseImageUrl": pick(payload, "baseImageUrl", "base_image_url") # 이미지 URL 전달
+        }
 
     if jt == "DIELINE":
         prompt = pick(payload, "prompt", "instruction", default="")

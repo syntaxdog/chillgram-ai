@@ -7,16 +7,11 @@ import json
 import time
 import asyncio
 import shutil
-import mimetypes
 import logging
-import functools
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
-from types import SimpleNamespace
-
 import requests
-from PIL import Image
+from pathlib import Path
+from typing import Any, List, Optional, Dict
+from types import SimpleNamespace
 from google import genai
 from google.genai import types
 
@@ -28,187 +23,99 @@ from typing import Any as UploadFile
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent.parent
 AI_DIR = BASE_DIR / "ai"
-
-# Logger setup
 logger = logging.getLogger(__name__)
 
+# [API 키 설정]
+KIE_API_KEY = os.environ.get("KIE_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
 # =========================================================
-# Async subprocess Helper
+# Async subprocess Helper (윈도우 호환성 강화)
 # =========================================================
 async def run_subprocess(cmd: List[str]) -> bytes:
-    """Run subprocess asynchronously"""
+    """Run subprocess asynchronously with robust encoding handling"""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
     stdout, stderr = await proc.communicate()
+    
     if proc.returncode != 0:
-        logger.error(f"Subprocess failed: {stderr.decode()}")
-        raise RuntimeError(f"Command failed: {cmd} \nError: {stderr.decode()}")
+        try:
+            err_msg = stderr.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                err_msg = stderr.decode("cp949") 
+            except:
+                err_msg = stderr.decode("utf-8", errors="replace")
+
+        logger.error(f"Subprocess failed: {err_msg}")
+        if "ffmpeg" in cmd[0]: return b""
+        raise RuntimeError(f"Command failed: {cmd} \nError: {err_msg}")
+        
     return stdout
 
 # =========================================================
-# Helpers from video.py (Ported & Async-ified)
+# Helpers
 # =========================================================
-
 async def _ffprobe_duration(path: str) -> float:
     try:
-        cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
-            path,
-        ]
+        # ✅ 해결: "-select_streams", "v:0" 부분을 삭제하여 오디오/비디오 모두 측정 가능
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
         out = await run_subprocess(cmd)
         return float(out.decode().strip())
-    except Exception as e:
-        logger.error(f"ffprobe duration failed: {e}")
-        return 0.0
+    except: return 0.0
 
 async def _extract_last_frame(video_path: str, out_path: str) -> str:
-    """FFmpeg을 사용하여 영상의 마지막 프레임을 이미지로 추출 (video.py 로직)"""
-    duration = await _ffprobe_duration(video_path)
-    # 마지막 지점에서 1.0초 전 프레임을 추출
-    seek_time = max(0, duration - 1.0)
-    
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(seek_time),
-        "-i", video_path,
-        "-frames:v", "1",
-        "-q:v", "2",  # 고화질
-        out_path
-    ]
+    """영상의 마지막 프레임 추출"""
+    # ffmpeg -sseof -3 (끝에서 3초 전부터 확인) -update 1 (마지막 프레임 덮어쓰기)
+    cmd = ["ffmpeg", "-y", "-sseof", "-3", "-i", video_path, "-update", "1", "-q:v", "2", out_path]
     await run_subprocess(cmd)
     return out_path
 
+async def _create_zoom_outro(image_path: str, duration: float, out_path: str):
+    """줌인 아웃트로 영상 생성"""
+    duration = max(2.0, duration)
+    # [수정] 윈도우 경로 역슬래시 문제 방지
+    image_path = image_path.replace("\\", "/")
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-i", image_path,
+        "-vf", f"scale=1280:720,zoompan=z='min(zoom+0.0015,1.5)':d={int(duration*30)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1280x720",
+        "-c:v", "libx264",
+        "-t", str(duration),
+        "-pix_fmt", "yuv420p",
+        "-r", "30",
+        out_path
+    ]
+    await run_subprocess(cmd)
+
 async def upload_image_to_hosting(image_path: str | Path) -> str:
-    """이미지를 공개 URL로 업로드 (catbox -> file.io 순서) - Threaded Requests"""
     image_path = str(image_path)
-    if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
-        raise RuntimeError(f"이미지 파일 이상: {image_path}")
+    if not os.path.exists(image_path): raise RuntimeError("Image missing")
 
     def _upload():
-        with open(image_path, "rb") as f:
-            file_content = f.read()
-
-        # 1. catbox.moe
+        with open(image_path, "rb") as f: content = f.read()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        # 1. tmpfiles.org
         try:
-            files = {"fileToUpload": ("image.png", file_content, "image/png")}
-            data = {"reqtype": "fileupload"}
-            resp = requests.post("https://catbox.moe/user/api.php", data=data, files=files, timeout=30)
-            if resp.status_code == 200:
-                return resp.text.strip()
-        except Exception:
-            pass
-
-        # 2. file.io
+            resp = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": ("img.png", content, "image/png")}, headers=headers, timeout=30)
+            if resp.status_code == 200 and resp.json().get("status") == "success":
+                return resp.json()["data"]["url"].replace("http://", "https://").replace("tmpfiles.org/", "tmpfiles.org/dl/")
+        except: pass
+        # 2. catbox.moe
         try:
-            files = {"file": ("image.png", file_content, "image/png")}
-            resp = requests.post("https://file.io/?expires=1d", files=files, timeout=30)
-            if resp.status_code == 200:
-                rj = resp.json()
-                if rj.get("success"):
-                    return rj.get("link")
-        except Exception:
-            pass
+            resp = requests.post("https://catbox.moe/user/api.php", data={"reqtype": "fileupload"}, files={"fileToUpload": ("img.png", content, "image/png")}, headers=headers, timeout=30)
+            if resp.status_code == 200: return resp.text.strip()
+        except: pass
         return None
 
     url = await asyncio.to_thread(_upload)
-    if url:
-        return url
-    raise RuntimeError("모든 이미지 호스팅 서비스 업로드 실패")
-
-# =========================================================
-# Suno AI Music (Ported from video.py)
-# =========================================================
-
-async def analyze_image_for_music(gclient, types, img_path: str) -> str:
-    """Gemini Vision: 이미지를 분석하여 Suno용 음악 프롬프트 생성 (Blocking part wrapped)"""
-    
-    def _blocking_gemini():
-        with open(img_path, "rb") as f: img_bytes = f.read()
-        prompt = """
-        Analyze this product image and create a music generation prompt for 'Suno AI' to make a background music for a 20s TV commercial.
-        
-        [Requirements]
-        1. Mood: Matches the product (e.g., Spicy chips -> Exciting/Energetic, Coffee -> Calm/Jazz).
-        2. Genre: Commercial BGM, High Quality.
-        3. Structure: Starts strong, and **MUST have a natural ending/fade-out EXACTLY at 19 seconds**.
-        4. Format: Single line English text description.
-        5. Example: "Upbeat pop track, energetic bass, crispy sound textures, spicy mood, 120 BPM, ending at 19s with a cymbal crash."
-        """
-        try:
-            resp = gclient.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Content(role="user", parts=[
-                        types.Part(text=prompt),
-                        types.Part.from_bytes(data=img_bytes, mime_type="image/png")
-                    ])
-                ]
-            )
-            return resp.text.strip()
-        except Exception:
-            return "Upbeat commercial background music, energetic, 30s"
-
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_gemini)
-
-async def generate_suno_music(kie_key: str, prompt: str) -> Optional[str]:
-    """KIE Suno API를 사용하여 음악 생성 - Threaded Requests"""
-    headers = {"Authorization": f"Bearer {kie_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "ai-music-api/generate",
-        "input": {
-            "model": "V4_5PLUS",
-            "customMode": True,
-            "instrumental": True, 
-            "style": prompt[:900], 
-            "title": "Ad Background Music",
-            "prompt": "", 
-            "callBackUrl": "playground"
-        }
-    }
-
-    def _generate():
-        try:
-            resp = requests.post("https://api.kie.ai/api/v1/jobs/createTask", headers=headers, json=payload, timeout=60)
-            if resp.status_code != 200: return None
-            task_data = resp.json()
-            if task_data.get("code") != 200: return None
-            task_id = task_data["data"]["id"]
-            
-            # Polling
-            for _ in range(60):
-                time.sleep(2)
-                stat_resp = requests.get(f"https://api.kie.ai/api/v1/jobs/getTask?id={task_id}", headers=headers, timeout=30)
-                if stat_resp.status_code == 200:
-                    stat_data = stat_resp.json()
-                    status = stat_data["data"]["status"]
-                    
-                    if status == "SUCCEEDED":
-                        res = stat_data["data"]["response"]
-                        try:
-                            if isinstance(res, dict):
-                                if "audio_urls" in res and res["audio_urls"]: return res["audio_urls"][0]
-                                if "audio_clips" in res and res["audio_clips"]:
-                                    return res["audio_clips"][0].get("audio_url") or res["audio_clips"][0].get("video_url")
-                            if isinstance(res, list) and len(res) > 0:
-                                 if isinstance(res[0], str) and res[0].startswith("http"): return res[0]
-                        except Exception:
-                            pass
-                        return None
-                    if status == "FAILED": return None
-        except Exception:
-            return None
-        return None
-
-    return await asyncio.to_thread(_generate)
-
-# =========================================================
-# Core Logic
-# =========================================================
+    if url: return url
+    raise RuntimeError("Image upload failed")
 
 def _ensure_product_dir(product_id: int) -> Path:
     d = BASE_DIR / str(product_id)
@@ -216,169 +123,311 @@ def _ensure_product_dir(product_id: int) -> Path:
     return d
 
 def _normalize_scenes_list(plan: Any) -> List[Dict[str, Any]]:
-    if isinstance(plan, dict):
-        if "scenes" in plan and isinstance(plan["scenes"], list): return plan["scenes"]
-        if "ad_plan" in plan and isinstance(plan["ad_plan"], list): return plan["ad_plan"]
-    if isinstance(plan, list): return plan
-    raise ValueError("Invalid plan structure")
+    if isinstance(plan, dict) and "scenes" in plan: return plan["scenes"]
+    return [{"scene_number": 1, "video_prompt": "Product showcase", "duration": 10}]
 
-async def _generate_video_clip_sora2(kie_key: str, image_url: str, prompt: str, duration: int = 15) -> str:
-    """Sora 2 Generating - Threaded Requests"""
+# =========================================================
+# [Gemini] Analyze Visuals & Write Lyrics (가사 2배 증량 + 재시도)
+# =========================================================
+async def analyze_visuals_and_write_lyrics(image_path: Path, product_name: str, concept: str) -> tuple[str, str]:
+    # 비상용 가사 (6줄 최적화) - 에러가 끝까지 해결 안 될 경우 사용
+    default_style = "upbeat k-pop, energetic, bright, female vocals"
+    default_lyrics = f"""
+    [Verse]
+    기분 좋은 바람이 불어오면
+    생각나는 그 맛, 정말 특별해
     
-    # 2. Prompt Sanitization & Enhancement
-    clean_prompt = "".join([c for c in prompt if ord(c) < 128])
-    clean_prompt += ", Korean audio, Korean speech, ambience of Korea"
+    [Chorus]
+    언제나 함께해, 나의 최애 간식
+    친구들과 나눠 먹는 즐거운 시간
+    행복이 가득한 {product_name}!
+    사랑해요 {product_name}!
+    """
+
+    if not GEMINI_API_KEY: return default_style, default_lyrics
+
+    print(f"👀 Gemini가 영상의 마지막 장면을 분석하고 가사를 씁니다...")
+    client = genai.Client(api_key=GEMINI_API_KEY)
     
-    # Sora 2 API Config
+    with open(image_path, "rb") as f: img_bytes = f.read()
+
+    prompt = f"""
+    You are a professional Creative Director.
+    Look at this image (the ending of Scene 1). Create a music style and lyrics for a 20-second commercial jingle.
+    
+    [PRODUCT] {product_name} ({concept})
+    
+    [LYRICS RULES]
+    1. **Length:** Write exactly **6 lines** (Verse 2 lines + Chorus 4 lines). This is the perfect length for a 20-30s song.
+    2. **Language:** Catchy Korean lyrics mixed with simple English hooks.
+    3. **Structure:**
+       - Verse: Brief intro of the vibe.
+       - Chorus: Catchy hook with product name.
+    4. **CRITICAL:** The very last line MUST end with the product name '{product_name}'.
+    
+    [OUTPUT JSON]
+    {{
+      "style_tags": "string (e.g. energetic, k-pop, female vocals)",
+      "lyrics": "string (formatted with newlines)"
+    }}
+    """
+    
+    # [핵심] 재시도 로직 (최대 4번 시도)
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-2.0-flash", 
+                contents=[types.Content(role="user", parts=[types.Part(text=prompt), types.Part.from_bytes(data=img_bytes, mime_type="image/png")])],
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            result = json.loads(response.text)
+            print(f"🎶 [스타일]: {result['style_tags']}")
+            print(f"🎤 [가사]:\n{result['lyrics']}")
+            return result['style_tags'], result['lyrics']
+            
+        except Exception as e:
+            # 429 에러(사용량 초과)가 발생하면 잠시 대기 후 재시도
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait_time = (attempt + 1) * 10  # 10초, 20초, 30초, 40초 대기
+                print(f"⚠️ 사용량 초과(429)! {wait_time}초 쉬고 다시 시도합니다... ({attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                # 다른 에러면 바로 비상용 가사 사용
+                print(f"❌ 분석 중 알 수 없는 오류: {e}")
+                break
+
+    print("❌ 4번 시도 실패. 비상용 가사를 사용합니다.")
+    return default_style, default_lyrics
+
+# =========================================================
+# [Suno API] Music Generation
+# =========================================================
+async def generate_suno_music_with_lyrics(kie_key: str, tags: str, lyrics: str, title: str) -> Optional[str]:
+    headers = {"Authorization": f"Bearer {kie_key}", "Content-Type": "application/json"}
+    gen_url = "https://api.kie.ai/api/v1/generate"
+    info_url = "https://api.kie.ai/api/v1/generate/record-info"
+    
+    print(f"🚀 Suno 음악 생성 요청...")
+    
+    def _request():
+        try:
+            payload = {
+                "model": "V3_5", "prompt": lyrics, "tags": tags, "title": f"Ad_{title}",
+                "customMode": True, "instrumental": False, "callBackUrl": "https://api.kie.ai/playground"
+            }
+            resp = requests.post(gen_url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 200: return resp.json().get("data", {}).get("taskId")
+        except: pass
+        return None
+
+    task_id = await asyncio.to_thread(_request)
+    if not task_id: return None
+    
+    print(f"✅ 음악 작업 ID: {task_id}")
+
+    async def _poll():
+        for _ in range(40):
+            await asyncio.sleep(10)
+            try:
+                r = await asyncio.to_thread(requests.get, info_url, headers=headers, params={"taskId": task_id}, timeout=20)
+                if r.status_code == 200:
+                    data = r.json().get("data", {})
+                    status = data.get("status") or data.get("state")
+                    if status in ["SUCCESS", "succeeded", "success"]:
+                        res_obj = data.get("response")
+                        if isinstance(res_obj, str): res_obj = json.loads(res_obj)
+                        
+                        suno_data = res_obj.get("sunoData")
+                        if suno_data and isinstance(suno_data, list) and len(suno_data) > 0:
+                            return suno_data[0].get("audioUrl")
+            except: pass
+        return None
+
+    return await _poll()
+
+# =========================================================
+# Video Generation (Sora 2)
+# =========================================================
+async def _generate_video_clip_sora2(kie_key: str, image_url: str, prompt: str, duration: int = 10) -> str:
     headers = {"Authorization": f"Bearer {kie_key}", "Content-Type": "application/json"}
     payload = {
         "model": "sora-2-image-to-video-stable",
         "input": {
-            "image_urls": [image_url],
-            "prompt": clean_prompt,
-            "duration": str(duration),
-            "resolution": "720p",
-            "mode": "normal"
+            "image_urls": [image_url], "prompt": prompt, "duration": str(duration),
+            "resolution": "720p", "mode": "normal", "audio": False
         }
     }
+    
+    print(f"🚀 Sora 영상 생성: {prompt[:30]}...")
 
     def _generate():
-        # Retry Loop
         for _ in range(3):
-            task_id = None
-            # Create Task
-            for _ in range(3):
-                try:
-                    resp = requests.post("https://api.kie.ai/api/v1/jobs/createTask", headers=headers, json=payload, timeout=60)
-                    resp_text = resp.text
-                    if resp.status_code == 429 or "heavy load" in resp_text.lower():
-                        time.sleep(60); continue
-                    
-                    data = json.loads(resp_text)
-                    if data.get("code") != 200:
-                        if "heavy load" in str(data).lower(): time.sleep(60); continue
-                        time.sleep(10); continue
-                    
-                    task_id = data.get("data", {}).get("taskId")
-                    if task_id: break
-                except Exception:
+            try:
+                resp = requests.post("https://api.kie.ai/api/v1/jobs/createTask", headers=headers, json=payload, timeout=60)
+                if resp.status_code != 200: time.sleep(5); continue
+                
+                task_id = resp.json()["data"]["taskId"]
+                for _ in range(60):
                     time.sleep(10)
-            
-            if not task_id: continue
-
-            # Poll Task
-            poll_url = f"https://api.kie.ai/api/v1/jobs/recordInfo?taskId={task_id}"
-            for _ in range(120): # 10 min
-                time.sleep(5)
-                try:
-                    p_resp = requests.get(poll_url, headers=headers, timeout=30)
-                    if p_resp.status_code != 200: continue
-                    p_data = p_resp.json()
-                    
-                    state = p_data.get("data", {}).get("state")
-                    if state == "success":
-                        res_json = json.loads(p_data["data"].get("resultJson", "{}"))
-                        url_list = res_json.get("resultUrls", [])
-                        if url_list:
-                            return url_list[0]
-                    elif state == "fail":
-                        fail_msg = p_data["data"].get("failMsg", "unknown")
-                        if "heavy load" in fail_msg.lower():
-                            time.sleep(60); break
-                        if "safety" in fail_msg.lower(): raise RuntimeError(f"Safety: {fail_msg}")
-                        break
-                except Exception as e:
-                    if "Safety" in str(e): raise e
-                    continue
+                    r = requests.get(f"https://api.kie.ai/api/v1/jobs/recordInfo?taskId={task_id}", headers=headers, timeout=30)
+                    if r.status_code != 200: continue
+                    state = r.json()["data"]["state"]
+                    if state == "success": return json.loads(r.json()["data"]["resultJson"])["resultUrls"][0]
+                    elif state == "fail": break
+            except: time.sleep(5)
         return None
 
-    res_url = await asyncio.to_thread(_generate)
-    if res_url:
-        return res_url
-    raise RuntimeError("Sora 2 Video Generation Failed")
+    url = await asyncio.to_thread(_generate)
+    if url: return url
+    raise RuntimeError("Video generation failed")
 
-async def _concat_and_mix(video_paths: List[str], bgm_path: Optional[str], out_path: str, fade: float = 0.5):
-    """FFmpeg Concatenation + BGM Mixing - Async"""
+async def _concat_video_list(video_paths: List[str], out_path: str):
+    """단순 연결 (재인코딩 적용으로 끊김 방지)"""
+    if len(video_paths) < 2:
+        return shutil.copy(video_paths[0], out_path)
     
-    # 1. Check durations & audio (Async FFprobe)
-    async def get_info(path):
-        try:
-            cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
-            dur = float((await run_subprocess(cmd)).decode().strip())
-            
-            cmd_a = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path]
-            out_a = (await run_subprocess(cmd_a)).decode().strip()
-            return dur, bool(out_a)
-        except: return 0.0, False
-
-    infos = [await get_info(v) for v in video_paths]
-    durs = [i[0] for i in infos]
-    
-    if len(durs) == 0: return
-
-    # Simple Video Crossfade Mapping (Similar logic)
-    cmd = ["ffmpeg", "-y"]
-    for v in video_paths: cmd += ["-i", v]
-    
-    filter_complex = ""
-    offset = durs[0] - fade
-    filter_complex += f"[0:v][1:v]xfade=transition=fade:duration={fade}:offset={offset}[v01];"
-    prev_v = "[v01]"
-    
-    if bgm_path and os.path.exists(bgm_path):
-        cmd += ["-i", bgm_path] 
-        bgm_idx = 2
-        filter_complex += f"[0:a][1:a]acrossfade=d={fade}:c1=tri:c2=tri[a_clips];"
-        filter_complex += f"[{bgm_idx}:a]atrim=0:19,afade=t=out:st=17:d=2,volume=0.3[bgm_trim];"
-        filter_complex += f"[a_clips][bgm_trim]amix=inputs=2:duration=first:dropout_transition=2[a_out]"
+    list_file = "concat_list.txt"
+    with open(list_file, "w", encoding='utf-8') as f:
+        for v in video_paths:
+            safe_path = v.replace("\\", "/")
+            f.write(f"file '{safe_path}'\n")
         
-        cmd += ["-filter_complex", filter_complex, "-map", prev_v, "-map", "[a_out]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path]
-    else:
-        filter_complex += f"[0:a][1:a]acrossfade=d={fade}:c1=tri:c2=tri[a_out]"
-        cmd += ["-filter_complex", filter_complex, "-map", prev_v, "-map", "[a_out]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out_path]
+    # [핵심 수정] -c copy 대신 -c:v libx264 사용 (강제 재인코딩)
+    # 포맷이 다른 두 영상(Sora + 줌인)을 합칠 때 copy를 쓰면 뒤쪽이 잘리는 문제 해결
+    cmd = [
+        "ffmpeg", "-y", 
+        "-f", "concat", 
+        "-safe", "0", 
+        "-i", list_file, 
+        "-c:v", "libx264",      # 재인코딩 필수
+        "-preset", "ultrafast", # 속도 최적화
+        "-pix_fmt", "yuv420p",  # 호환성 확보
+        out_path
+    ]
+    
+    await run_subprocess(cmd)
+
+async def _mix_audio_video_auto_extend(video_path: str, music_url: Optional[str], image_path: Path, out_path: str):
+    """영상+음악 합성 (음악이 길면 연장 + 페이드아웃 자동 계산)"""
+    bgm_path = "bgm_temp.mp3"
+    
+    if not music_url:
+        return shutil.copy(video_path, out_path)
 
     try:
-        await run_subprocess(cmd)
-    except Exception as e:
-        logger.error(f"Complex mix failed, falling back to simple concat: {e}")
-        # Fallback (Sync I/O for file write is fine)
-        with open("concat.txt", "w") as f:
-            for v in video_paths: f.write(f"file '{v}'\n")
-        
-        await run_subprocess(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "concat.txt", "-c", "copy", out_path])
+        content = await asyncio.to_thread(requests.get, music_url)
+        with open(bgm_path, "wb") as f: f.write(content.content)
+    except:
+        return shutil.copy(video_path, out_path)
 
+    vid_dur = await _ffprobe_duration(video_path)
+    mus_dur = await _ffprobe_duration(bgm_path)
+    
+    print(f"⏱ 길이 비교: 영상 {vid_dur}초 vs 음악 {mus_dur}초")
+    
+    final_video_input = video_path
+    final_duration = vid_dur
+    
+    # [수정] 음악이 0.1초라도 길면 무조건 연장 시도
+    if mus_dur > vid_dur + 0.1:
+        gap = mus_dur - vid_dur
+        print(f"🎬 음악이 {gap:.1f}초 더 깁니다. 줌인 아웃트로 생성...")
+        
+        outro_path = "outro_zoom.mp4"
+        await _create_zoom_outro(str(image_path), gap, outro_path)
+        
+        merged_path = "merged_visual.mp4"
+        await _concat_video_list([video_path, outro_path], merged_path)
+        
+        # 병합 결과 확인 (파일이 있고, 길이가 늘어났는지 체크)
+        if os.path.exists(merged_path):
+            merged_dur = await _ffprobe_duration(merged_path)
+            if merged_dur > vid_dur: 
+                final_video_input = merged_path
+                final_duration = merged_dur
+    else:
+        final_duration = min(vid_dur, mus_dur)
+
+    # [수정] 하드코딩된 18초 제거 -> 실제 끝나는 시간 기준 2초 전으로 계산
+    fade_start = max(0, final_duration - 2)
+    print(f"🎚️ 오디오 페이드아웃 시작: {fade_start}초")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", final_video_input,
+        "-i", bgm_path,
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "copy",
+        "-af", f"afade=t=out:st={fade_start}:d=2", 
+        "-shortest",
+        out_path
+    ]
+    
+    try: await run_subprocess(cmd)
+    except: shutil.copy(video_path, out_path)
+    
+    # 임시 파일 정리
+    for f in [bgm_path, "concat_list.txt", "outro_zoom.mp4", "merged_visual.mp4"]:
+        if os.path.exists(f): 
+            try: os.remove(f)
+            except: pass
 
 # =========================================================
 # Main Entry Point
 # =========================================================
-
 async def generate_video_for_product(product_id: int, req: Any, product_image: UploadFile) -> Path:
-    """Main Service Function - Fully Async"""
-    
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    kie_key = os.environ.get("KIE_API_KEY", "")
-    if not gemini_key or not kie_key:
-        raise ValueError("Missing API Keys")
+    if not GEMINI_API_KEY or not KIE_API_KEY: raise ValueError("Keys missing")
 
-    gclient = genai.Client(api_key=gemini_key)
+    gclient = genai.Client(api_key=GEMINI_API_KEY)
     out_dir = _ensure_product_dir(product_id)
+    if isinstance(req, dict): req = SimpleNamespace(**req)
     
-    # Ensure req is an object for dot notation access (supports both dict from worker and object from FastAPI)
-    if isinstance(req, dict):
-        req = SimpleNamespace(**req)
+    if isinstance(product_image, bytes): img_bytes = product_image
+    elif hasattr(product_image, "read"): img_bytes = await product_image.read()
+    else: raise ValueError("Invalid image")
     
-    # 1. Save Image (Supports UploadFile-like or raw bytes)
-    if isinstance(product_image, bytes):
-        img_bytes = product_image
-    elif hasattr(product_image, "read"):
-        img_bytes = await product_image.read()
-    else:
-        raise ValueError("Invalid product_image type. Expected bytes or UploadFile-like object.")
-        
-    product_img_path = out_dir / f"product-{int(time.time())}.png"
+    product_img_path = out_dir / f"product_origin.png"
     with open(product_img_path, "wb") as f: f.write(img_bytes)
 
-    # 2. Plan Ad (Gemini) - Blocking call wrapped in executor
+    # 1-1. [Auto-Inference] 만약 필수 정보가 없으면 이미지 보고 자동 분석
+    if not getattr(req, "food_name", None) or not getattr(req, "ad_concept", None):
+        print("⚠️ 제품 정보 누락! Gemini가 이미지를 보고 정보를 추론합니다...")
+        
+        infer_prompt = """
+        Analyze this product image and extract info for a commercial.
+        Output JSON:
+        {
+            "food_name": "Product Name (Korean)",
+            "food_type": "Category (e.g. Snack, Drink)",
+            "ad_concept": "Best matching ad concept (e.g. Refreshing, Spicy, Premium)",
+            "ad_req": "Key selling points"
+        }
+        """
+        try:
+            resp_inf = await asyncio.to_thread(
+                gclient.models.generate_content,
+                model="gemini-2.0-flash", 
+                contents=[types.Content(role="user", parts=[types.Part(text=infer_prompt), types.Part.from_bytes(data=img_bytes, mime_type="image/png")])],
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            inferred = json.loads(resp_inf.text)
+            
+            # req 객체 업데이트
+            req.food_name = inferred.get("food_name", "Unknown Product")
+            req.food_type = inferred.get("food_type", "Food")
+            req.ad_concept = inferred.get("ad_concept", "Delicious")
+            req.ad_req = inferred.get("ad_req", "Showcase the product")
+            
+            print(f"✅ 추론 완료: {req.food_name} / {req.ad_concept}")
+        except Exception as e:
+            print(f"❌ 추론 실패, 기본값 사용: {e}")
+            req.food_name = "맛있는 제품"
+            req.food_type = "음식"
+            req.ad_concept = "맛있게 먹는 모습"
+            req.ad_req = "제품 강조"
+
     SYSTEM_PROMPT = """너는 숙련된 숏츠 광고 감독이다.
 목표: 20초 광고, 2개 씬(Clip). [Clip 1: 0~10초] -> [Clip 2: 10~20초]
 [필수]
@@ -399,121 +448,74 @@ JSON Only.
     {{
       "scene_number": 1,
       "duration_hint_sec": 10,
-      "scene_script": "Clip 1 한국어 대사",
-      "nano_image_prompt": "Clip 1 이미지 프롬프트 (영어)",
       "video_prompt": "Clip 1 영상 프롬프트 (영어)"
     }},
     {{
       "scene_number": 2,
       "duration_hint_sec": 10,
-      "scene_script": "Clip 2 한국어 대사",
-      "nano_image_prompt": "Clip 2 이미지 프롬프트 (영어, Clip 1 연결성)",
       "video_prompt": "Clip 2 영상 프롬프트 (영어)"
     }}
   ]
 }}
 """
-    # Wrap Gemini synchronous call
-    def _plan_ad():
+    
+    async def _plan():
         resp = gclient.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Content(role="user", parts=[
-                    types.Part(text=SYSTEM_PROMPT + "\n" + plan_prompt),
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/png")
-                ])
-            ],
+            model="gemini-2.0-flash",
+            contents=[types.Content(role="user", parts=[types.Part(text=SYSTEM_PROMPT + "\n" + plan_prompt), types.Part.from_bytes(data=img_bytes, mime_type="image/png")])],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(resp.text)
-
+    
     try:
-        loop = asyncio.get_running_loop()
-        plan = await loop.run_in_executor(None, _plan_ad)
+        plan = await _plan()
         scenes = _normalize_scenes_list(plan)
-    except Exception as e:
-        raise RuntimeError(f"Planning failed: {e}")
+    except:
+        scenes = [{"scene_number": 1, "video_prompt": "Intro", "duration": 10}, {"scene_number": 2, "video_prompt": "Climax", "duration": 10}]
 
-    # 3. Execution Loop
     video_paths = []
-    current_ref_img = product_img_path
-    bgm_path = None
     
-    for i, sc in enumerate(scenes):
-        sid = sc.get("scene_number", i+1)
-        
-        # A. Image Generation (Gemini) - Wrapped
-        prompt = sc["nano_image_prompt"] + "\n\n[STRICT: Product text must match exactly. Korean style.]"
-        
-        def _gen_img(ref_path):
-            with open(ref_path, "rb") as f: ref_bytes = f.read()
-            parts = [
-                types.Part(text=prompt),
-                types.Part.from_bytes(data=ref_bytes, mime_type="image/png")
-            ]
-            resp = gclient.models.generate_content(
-                model="gemini-2.5-flash-image",
-                contents=[types.Content(role="user", parts=parts)],
-                config=types.GenerateContentConfig(response_modalities=["IMAGE"])
-            )
-            return resp.candidates[0].content.parts[0].inline_data.data
-
-        scene_img_path = out_dir / f"scene_{sid}.png"
-        try:
-            img_data = await loop.run_in_executor(None, functools.partial(_gen_img, current_ref_img))
-            img = Image.open(io.BytesIO(img_data))
-            img.save(scene_img_path)
-        except Exception as e:
-            raise RuntimeError(f"Image Gen Failed Scene {sid}: {e}")
-
-        # B. Music (Scene 1 only) - Async
-        if sid == 1:
-            try:
-                music_prompt = await analyze_image_for_music(gclient, types, str(scene_img_path))
-                bgm_url = await generate_suno_music(kie_key, music_prompt)
-                if bgm_url:
-                    bgm_path = out_dir / "bgm.mp3"
-                    def _download_bgm():
-                        r = requests.get(bgm_url, timeout=60)
-                        if r.status_code == 200:
-                            with open(bgm_path, "wb") as f: f.write(r.content)
-                    await asyncio.to_thread(_download_bgm)
-            except Exception:
-                pass 
-
-        # C. Video Generation (Sora 2) - Async (with internal threaded requests)
-        # 1. Upload to Hosting
-        image_url = await upload_image_to_hosting(scene_img_path)
-        if image_url.startswith("http://"): image_url = image_url.replace("http://", "https://")
-        
-        # Wait for propagation
-        await asyncio.sleep(6)
-
-        vid_url = await _generate_video_clip_sora2(
-            kie_key=kie_key,
-            image_url=image_url,
-            prompt=sc["video_prompt"],
-            duration=10
-        )
-        
-        # Download Video
-        vid_path = out_dir / f"scene_{sid}.mp4"
-        def _download_vid():
-            r = requests.get(vid_url, timeout=120)
-            if r.status_code == 200:
-                with open(vid_path, "wb") as f: f.write(r.content)
-        await asyncio.to_thread(_download_vid)
-                    
-        video_paths.append(str(vid_path))
-        
-        # D. Extract Last Frame - Async
-        if i < len(scenes) - 1:
-            last_frame = out_dir / f"scene_{sid}_last.png"
-            await _extract_last_frame(str(vid_path), str(last_frame))
-            current_ref_img = last_frame
-
-    # 4. Final Concat & Mix - Async
-    final_mp4 = out_dir / "final_ad.mp4"
-    await _concat_and_mix(video_paths, str(bgm_path) if bgm_path else None, str(final_mp4))
+    # 3. [STEP 1] Scene 1 생성
+    print("🚀 [Step 1] Scene 1 생성 중...")
+    sc1 = scenes[0]
+    img_url_1 = await upload_image_to_hosting(product_img_path)
+    vid_url_1 = await _generate_video_clip_sora2(KIE_API_KEY, img_url_1, sc1["video_prompt"] + " [Korean model]", 10)
     
+    vid_path_1 = out_dir / "scene_1.mp4"
+    with open(vid_path_1, "wb") as f: f.write(requests.get(vid_url_1).content)
+    video_paths.append(str(vid_path_1))
+
+    # 4. [STEP 2] 분석 & Scene 2
+    print("🚀 [Step 2] Scene 1 종료 장면 분석...")
+    last_frame_path = out_dir / "scene_1_last.png"
+    await _extract_last_frame(str(vid_path_1), str(last_frame_path))
+    
+    music_style, music_lyrics = await analyze_visuals_and_write_lyrics(last_frame_path, req.food_name, req.ad_concept)
+
+    print("🚀 [Step 3] Scene 2와 음악 병렬 생성...")
+    async def task_scene_2():
+        img_url_2 = await upload_image_to_hosting(last_frame_path)
+        sc2 = scenes[1] if len(scenes) > 1 else scenes[0]
+        ending_prompt = " [Camera: Slow linger, smooth fade out feeling] [Emotion: Satisfaction]"
+        v_url = await _generate_video_clip_sora2(KIE_API_KEY, img_url_2, sc2["video_prompt"] + ending_prompt, 10)
+        p = out_dir / "scene_2.mp4"
+        with open(p, "wb") as f: f.write(requests.get(v_url).content)
+        return str(p)
+
+    async def task_music():
+        return await generate_suno_music_with_lyrics(KIE_API_KEY, music_style, music_lyrics, req.food_name)
+
+    results = await asyncio.gather(task_scene_2(), task_music())
+    vid_path_2, music_url = results[0], results[1]
+    video_paths.append(vid_path_2)
+
+    # 6. [STEP 4] 최종 합체
+    print("🚀 [Step 4] 최종 편집 (스마트 아웃트로)...")
+    stitched_mp4 = out_dir / "stitched_raw.mp4"
+    await _concat_video_list(video_paths, str(stitched_mp4))
+    
+    final_mp4 = out_dir / "final_ad_video.mp4"
+    await _mix_audio_video_auto_extend(str(stitched_mp4), music_url, product_img_path, str(final_mp4))
+    
+    print(f"🎉 모든 작업 완료! 최종 파일: {final_mp4}")
     return final_mp4
