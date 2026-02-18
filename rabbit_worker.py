@@ -177,7 +177,7 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if jt == "DIELINE":
         prompt = pick(payload, "prompt", "instruction", default="")
         concept_file = pick(payload, "concept_file", "conceptFile", default="package_input.png")
-        return {"prompt": prompt, "concept_file": concept_file}
+        return {"prompt": prompt, "concept_file": concept_file, "subType": "DIELINE"}
 
     sub_type = pick(payload, "subType", "sub_type")
     if sub_type == "DIELINE":
