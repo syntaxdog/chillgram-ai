@@ -108,8 +108,11 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if jt == "BANNER":
         # headline 제거 (사용 안함)
         typo_text = pick(payload, "typo_text", "typoText", "finalCopy")
-        ratio = pick(payload, "ratio", "Ratio", "bannerRatio")
-        guideline = pick(payload, "guideline", "Guideline", default="")
+        ratio = pick(payload, "ratio", "Ratio", "bannerRatio", "bannerSize")
+        guideline = pick(payload, "guideline", "Guideline", "guideLine", default="")
+        if isinstance(guideline, dict):
+            guideline = json.dumps(guideline, ensure_ascii=False)
+
         base_image_url = pick(payload, "baseImageUrl", "base_image_url")
 
         if not typo_text:
@@ -146,7 +149,6 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "baseImageUrl": base_image_url
         }
 
-    if jt == "VIDEO":
     if jt == "VIDEO":
         food_name = pick(payload, "food_name", "foodName")
         food_type = pick(payload, "food_type", "foodType")
