@@ -165,7 +165,7 @@ IMPORTANT:
 - Generate matching food props scattered around edges"""
 
         response = self.client.models.generate_content(
-            model="gemini-3-pro-image-preview",
+            model="gemini-2.5-flash-image",
             contents=[prompt, product_image],
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE", "TEXT"],

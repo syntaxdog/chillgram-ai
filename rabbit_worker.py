@@ -327,13 +327,18 @@ class JobRunner:
     def run_sns(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
         product_path = d / "package.png"
-        if not product_path.exists():
-            raise FileNotFoundError("package.png not found. Upload/generate package first.")
+
+        # ✅ baseImageUrl에서 항상 다운로드
+        base_image_url = payload.get("baseImageUrl")
+        if not base_image_url:
+            raise ValueError("SNS payload missing: baseImageUrl")
+        print(f"[SNS] Downloading base image from {base_image_url}", flush=True)
+        self.uploader.download_to_file(base_image_url, product_path)
 
         background_path = d / "sns_background.png"
         final_path = d / "sns.png"
 
-        gen = SNSImageGenerator()
+        gen = SNSImageGenerator(api_key=self.api_key)
         gen.generate(
             product_path=str(product_path),
             main_text=payload["main_text"],
