@@ -19,6 +19,11 @@ from services.package_generate import PackageGenerator
 
 load_dotenv()
 
+# [Fix] rembg U2NET_HOME permission denied error
+# 컨테이너 --user 1005:1006 실행 시 HOME=/ → /.u2net 권한 에러 방지
+# Dockerfile ENV U2NET_HOME과 이중 안전장치
+os.environ.setdefault("U2NET_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".u2net"))
+
 # =========================
 # Env
 # =========================

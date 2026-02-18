@@ -21,5 +21,11 @@ COPY . .
 
 ENV PYTHONUNBUFFERED=1
 ENV NUMBA_DISABLE_CACHE=1
+ENV U2NET_HOME=/app/.u2net
+
+# rembg U2Net 모델 사전 다운로드 (런타임 콜드스타트 제거)
+# --user 1005:1006 실행 시에도 읽기 가능하도록 권한 설정
+RUN python -c "from rembg import remove; from PIL import Image; remove(Image.new('RGBA',(1,1)))" \
+    && chmod -R 755 /app/.u2net
 
 CMD ["python", "rabbit_worker.py"]

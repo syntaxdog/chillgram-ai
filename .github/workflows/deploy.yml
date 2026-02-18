@@ -88,6 +88,7 @@ jobs:
                 -v /opt/chillgram/secrets/gcs.json:/secrets/gcs.json:ro \
                 -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs.json \
                 -e NUMBA_CACHE_DIR=/tmp \
+                -e HOME=/app \
                 python-worker
           
               echo "⏳ Waiting for container to start..."
