@@ -397,6 +397,16 @@ class JobRunner:
     async def run_video(self, project_id: int, payload: Dict[str, Any]) -> Tuple[Path, str, str]:
         d = ensure_project_dir(project_id)
         package_path = d / "package.png"
+        
+        # ✅ [수정] 파일이 없으면 baseImageUrl에서 다운로드
+        if not package_path.exists():
+            base_image_url = payload.get("baseImageUrl")
+            if not base_image_url:
+                raise ValueError("VIDEO payload missing: baseImageUrl (package.png not found)")
+            
+            print(f"[VIDEO] Downloading base image from {base_image_url}", flush=True)
+            self.uploader.download_to_file(base_image_url, package_path)
+
         if not package_path.exists():
             raise FileNotFoundError("package.png not found. VIDEO requires package.png in ai/{projectId}/")
 
