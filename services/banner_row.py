@@ -4,6 +4,11 @@ import os
 import logging
 import traceback
 from PIL import Image, ImageFilter
+
+# [Fix] rembg U2NET_HOME permission denied error
+# 컨테이너 --user 1005:1006 실행 시 HOME=/ → /.u2net 권한 에러 방지
+os.environ.setdefault("U2NET_HOME", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".u2net"))
+
 from rembg import remove
 from google import genai
 from google.genai import types
@@ -109,7 +114,7 @@ def create_guide_with_product(background, placement, product_img):
     return guide
 
 class AdBannerGenerator:
-    def __init__(self, api_key, model_name="gemini-3-pro-preview", ratio="1:1"):
+    def __init__(self, api_key, model_name="gemini-2.5-flash", ratio="1:1"):
         self.client = genai.Client(api_key=api_key)
         self.model = model_name
         
@@ -179,7 +184,7 @@ class AdBannerGenerator:
         )
         try:
             r = self.client.models.generate_content(
-                model="gemini-3-pro-preview", # Using a fast model for analysis
+                model="gemini-2.5-flash", # Using a fast model for analysis
                 contents=[types.Content(role="user", parts=[
                     types.Part.from_text(text=prompt), orig_part,
                 ])],
@@ -204,7 +209,7 @@ class AdBannerGenerator:
         )
         try:
             r = self.client.models.generate_content(
-                model="gemini-3-pro-preview", 
+                model="gemini-2.5-flash", 
                 contents=prompt,
             )
             return r.text.strip()
@@ -253,7 +258,7 @@ class AdBannerGenerator:
         ]
 
         resp = self._retry(lambda: self.client.models.generate_content(
-            model=self.model,
+            model="gemini-2.5-flash-image", # [Fix] Use image generation model
             contents=[types.Content(role="user", parts=parts)],
             config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
         ))
@@ -347,7 +352,7 @@ class AdBannerGenerator:
         )
 
         resp = self._retry(lambda: self.client.models.generate_content(
-            model=self.model,
+            model="gemini-2.5-flash-image", # [Fix] Use image generation model
             contents=[types.Content(role="user", parts=[
                 types.Part.from_text(text=prompt), guide_part,
             ])],
