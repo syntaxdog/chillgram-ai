@@ -109,7 +109,7 @@ def create_guide_with_product(background, placement, product_img):
     return guide
 
 class AdBannerGenerator:
-    def __init__(self, api_key, model_name="gemini-2.0-flash-exp", ratio="1:1"):
+    def __init__(self, api_key, model_name="gemini-3-pro-preview", ratio="1:1"):
         self.client = genai.Client(api_key=api_key)
         self.model = model_name
         
@@ -179,7 +179,7 @@ class AdBannerGenerator:
         )
         try:
             r = self.client.models.generate_content(
-                model="gemini-2.0-flash-exp", # Using a fast model for analysis
+                model="gemini-3-pro-preview", # Using a fast model for analysis
                 contents=[types.Content(role="user", parts=[
                     types.Part.from_text(text=prompt), orig_part,
                 ])],
@@ -204,7 +204,7 @@ class AdBannerGenerator:
         )
         try:
             r = self.client.models.generate_content(
-                model="gemini-2.0-flash-exp", 
+                model="gemini-3-pro-preview", 
                 contents=prompt,
             )
             return r.text.strip()
