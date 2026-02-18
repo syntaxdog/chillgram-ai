@@ -26,6 +26,10 @@ try:
 except ImportError as e:
     raise ImportError("opencv-python 필요: pip install opencv-python") from e
 
+# ✅ rembg 모델 캐시 경로 설정 (Docker 권한 이슈 방지)
+if not os.environ.get("U2NET_HOME"):
+    os.environ["U2NET_HOME"] = str(Path.home() / ".u2net")
+
 try:
     from rembg import remove as remove_bg
 
