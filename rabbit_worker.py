@@ -158,10 +158,20 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if jt == "VIDEO":
-        food_name = pick(payload, "food_name", "foodName")
-        food_type = pick(payload, "food_type", "foodType")
+        food_name = pick(payload, "food_name", "foodName", "productName")
+        food_type = pick(payload, "food_type", "foodType", "category")
         ad_concept = pick(payload, "ad_concept", "adConcept")
         ad_req = pick(payload, "ad_req", "adReq")
+
+        # [수정] guideLine에서 정보 추출 (ad_concept <- title, ad_req <- summary)
+        if not ad_concept or not ad_req:
+            gl = payload.get("guideLine")
+            if isinstance(gl, str):
+                try: gl = json.loads(gl)
+                except: gl = {}
+            if isinstance(gl, dict):
+                if not ad_concept: ad_concept = gl.get("title")
+                if not ad_req: ad_req = gl.get("summary")
         
         # [수정] 필수값이 없더라도, 이미지가 있으면 video_2.py에서 자동 추론하도록 허용
         # 최소한의 식별자(baseImageUrl)는 있어야 함 (또는 이미 다운로드된 package.png)
