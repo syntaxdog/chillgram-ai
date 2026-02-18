@@ -69,7 +69,6 @@ def ensure_dir(path: Path) -> Path:
 def ensure_project_dir(project_id: int) -> Path:
     return ensure_dir(AI_DIR / str(project_id))
 
-
 def pick(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         if k in d and d[k] is not None:
@@ -126,13 +125,14 @@ def normalize_payload(job_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if jt == "SNS":
-        main_text = pick(payload, "main_text", "mainText", "finalCopy")
+        main_text = pick(payload, "main_text", "mainText", "finalCopy", "typoText")
+        guideline = pick(payload, "guideline", "guideLine")
+        base_image_url = pick(payload, "baseImageUrl", "base_image_url")
+
         sub_text = pick(payload, "sub_text", "subText", default="")
         preset = pick(payload, "preset")
         custom_prompt = pick(payload, "custom_prompt", "customPrompt")
-        guideline = pick(payload, "guideline")
         save_background = pick(payload, "save_background", "saveBackground", default=True)
-        base_image_url = pick(payload, "baseImageUrl", "base_image_url")
 
         if not main_text:
             raise ValueError(f"SNS payload missing: mainText/main_text (Available keys: {list(payload.keys())})")
