@@ -316,7 +316,10 @@ async def _concat_video_list(video_paths: List[str], out_path: str):
     if len(video_paths) < 2:
         return shutil.copy(video_paths[0], out_path)
     
-    list_file = "concat_list.txt"
+    # [수정] concat_list.txt를 out_path가 있는 폴더에 생성
+    out_dir = Path(out_path).parent
+    list_file = out_dir / "concat_list.txt"
+    
     with open(list_file, "w", encoding='utf-8') as f:
         for v in video_paths:
             safe_path = v.replace("\\", "/")
@@ -336,7 +339,9 @@ async def _concat_video_list(video_paths: List[str], out_path: str):
 
 async def _mix_audio_video_auto_extend(video_path: str, music_url: Optional[str], image_path: Path, out_path: str):
     """영상+음악 합성 (음악이 길면 연장 + 페이드아웃 자동 계산)"""
-    bgm_path = "bgm_temp.mp3"
+    # [수정] 임시 파일들을 out_path가 있는 폴더(product_dir) 내부에 생성하여 권한 문제 방지
+    out_dir = Path(out_path).parent
+    bgm_path = out_dir / "bgm_temp.mp3"
     
     if not music_url:
         return shutil.copy(video_path, out_path)
@@ -348,27 +353,28 @@ async def _mix_audio_video_auto_extend(video_path: str, music_url: Optional[str]
         return shutil.copy(video_path, out_path)
 
     vid_dur = await _ffprobe_duration(video_path)
-    mus_dur = await _ffprobe_duration(bgm_path)
+    mus_dur = await _ffprobe_duration(str(bgm_path))
     
     print(f"⏱ 길이 비교: 영상 {vid_dur}초 vs 음악 {mus_dur}초")
     
     final_video_input = video_path
     final_duration = vid_dur
     
+    # 임시 파일 경로들
+    outro_path = out_dir / "outro_zoom.mp4"
+    merged_path = out_dir / "merged_visual.mp4"
+
     if mus_dur > vid_dur + 0.1:
         gap = mus_dur - vid_dur
         print(f"🎬 음악이 {gap:.1f}초 더 깁니다. 줌인 아웃트로 생성...")
         
-        outro_path = "outro_zoom.mp4"
-        await _create_zoom_outro(str(image_path), gap, outro_path)
+        await _create_zoom_outro(str(image_path), gap, str(outro_path))
+        await _concat_video_list([video_path, str(outro_path)], str(merged_path))
         
-        merged_path = "merged_visual.mp4"
-        await _concat_video_list([video_path, outro_path], merged_path)
-        
-        if os.path.exists(merged_path):
-            merged_dur = await _ffprobe_duration(merged_path)
+        if merged_path.exists():
+            merged_dur = await _ffprobe_duration(str(merged_path))
             if merged_dur > vid_dur: 
-                final_video_input = merged_path
+                final_video_input = str(merged_path)
                 final_duration = merged_dur
     else:
         final_duration = min(vid_dur, mus_dur)
@@ -379,12 +385,12 @@ async def _mix_audio_video_auto_extend(video_path: str, music_url: Optional[str]
     cmd = [
         "ffmpeg", "-y",
         "-i", final_video_input,
-        "-i", bgm_path,
+        "-i", str(bgm_path),
         "-map", "0:v", "-map", "1:a",
         "-c:v", "copy",
         "-af", f"afade=t=out:st={fade_start}:d=2", 
         "-shortest",
-                out_path
+        out_path
     ]
     
     try:
@@ -392,10 +398,17 @@ async def _mix_audio_video_auto_extend(video_path: str, music_url: Optional[str]
     except Exception:
         shutil.copy(video_path, out_path)
     
-    for f in [bgm_path, "concat_list.txt", "outro_zoom.mp4", "merged_visual.mp4"]:
-        if os.path.exists(f): 
+    # [수정] 임시 파일 정리 (Path 객체 사용)
+    for f in [bgm_path, outro_path, merged_path]:
+        if f.exists(): 
             try: os.remove(f)
             except: pass
+    
+    # concat_list.txt는 _concat_video_list 내부에서 처리되므로 여기선 생략하거나 별도 처리
+    concat_list = out_dir / "concat_list.txt"
+    if concat_list.exists():
+        try: os.remove(concat_list)
+        except: pass
 
 # =========================================================
 # Main Entry Point
